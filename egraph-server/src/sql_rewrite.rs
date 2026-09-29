@@ -1,6 +1,6 @@
 use egg::{rewrite, EGraph, FromOp, Id, Language, RecExpr, Rewrite, Runner};
 use rusqlite::Connection;
-use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, UnaryOperator};
+use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Query, SetExpr, UnaryOperator};
 use sqlparser::tokenizer::Span;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -2547,12 +2547,167 @@ fn identity_variants(where_expr: &SqlExpr, source_sql: &str, max_variants: usize
     variants
 }
 
+/// How deep the subquery-decomposition recursion may go before it stops. Deeper nesting is
+/// vanishingly rare in generated queries, and the limit keeps one pathological query from
+/// spending the whole budget inside itself.
+const MAX_SUBQUERY_DEPTH: usize = 3;
+
+/// The WHERE predicate of a subquery, if it has one. GROUP BY/HAVING and the other subquery
+/// clauses are left alone: only the WHERE is rewritten, so only its equivalence matters.
+fn subquery_selection(query: &Query) -> Option<&SqlExpr> {
+    match query.body.as_ref() {
+        SetExpr::Select(sel) => sel.selection.as_ref(),
+        _ => None,
+    }
+}
+
+fn with_selection(query: &Query, new_selection: SqlExpr) -> Box<Query> {
+    let mut q = query.clone();
+    if let SetExpr::Select(sel) = q.body.as_mut() {
+        sel.selection = Some(new_selection);
+    }
+    Box::new(q)
+}
+
+/// Variants for predicates built around a subquery: `x IN (SELECT ... WHERE p)`,
+/// `EXISTS (SELECT ... WHERE p)` and `(SELECT ...) op x`. The e-graph language has no node for
+/// these - the whole predicate falls through to one opaque Symbol - so its rules never see the
+/// subquery's own WHERE. Rewriting that inner predicate and sewing each variant back into the
+/// subquery reaches shapes the identity fallback cannot, while the outer structure stays
+/// untouched: the subquery is not copied or moved, only its WHERE is replaced by an expression
+/// that the validator has already shown to be three-valued equivalent to the original.
+///
+/// `NOT (...)` and plain parentheses around the whole predicate are unwrapped first and re-wrapped
+/// afterwards, because both the parser (as `negated`) and the generator (as an explicit NOT) can
+/// put them there.
+fn try_subquery_variants(
+    where_expr: &SqlExpr,
+    source_sql: &str,
+    max_variants: usize,
+    iter_limit: usize,
+    depth: usize,
+) -> Option<Vec<SqlExpr>> {
+    if depth >= MAX_SUBQUERY_DEPTH {
+        return None;
+    }
+
+    // Unwrap transparent wrappers, remembering NOTs so the variants get them back.
+    let mut not_wrapped = false;
+    let mut cur = where_expr;
+    loop {
+        match cur {
+            SqlExpr::Nested(inner) => cur = inner.as_ref(),
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: inner,
+            } => {
+                not_wrapped = !not_wrapped;
+                cur = inner.as_ref();
+            }
+            _ => break,
+        }
+    }
+
+    let (inner_pred, rebuild): (&SqlExpr, Box<dyn Fn(SqlExpr) -> SqlExpr>) = match cur {
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let inner = subquery_selection(subquery)?;
+            let left = (**expr).clone();
+            let q = (**subquery).clone();
+            let neg = *negated;
+            (
+                inner,
+                Box::new(move |p: SqlExpr| SqlExpr::InSubquery {
+                    expr: Box::new(left.clone()),
+                    subquery: with_selection(&q, p),
+                    negated: neg,
+                }),
+            )
+        }
+        SqlExpr::Exists { subquery, negated } => {
+            let inner = subquery_selection(subquery)?;
+            let q = (**subquery).clone();
+            let neg = *negated;
+            (
+                inner,
+                Box::new(move |p: SqlExpr| SqlExpr::Exists {
+                    subquery: with_selection(&q, p),
+                    negated: neg,
+                }),
+            )
+        }
+        SqlExpr::Subquery(q) => {
+            let inner = subquery_selection(q)?;
+            let q = (**q).clone();
+            (
+                inner,
+                Box::new(move |p: SqlExpr| SqlExpr::Subquery(with_selection(&q, p))),
+            )
+        }
+        _ => return None,
+    };
+
+    let inner_variants = generate_equivalent_where_clauses_impl(
+        inner_pred,
+        source_sql,
+        max_variants,
+        iter_limit,
+        depth + 1,
+    )
+    .ok()?;
+    if inner_variants.is_empty() {
+        return None;
+    }
+
+    Some(
+        inner_variants
+            .into_iter()
+            .map(|p| {
+                let mut e = rebuild(p);
+                if not_wrapped {
+                    e = SqlExpr::UnaryOp {
+                        op: UnaryOperator::Not,
+                        expr: Box::new(e),
+                    };
+                }
+                e
+            })
+            .collect(),
+    )
+}
+
 pub fn generate_equivalent_where_clauses(
     where_expr: &SqlExpr,
     source_sql: &str,
     max_variants: usize,
     iter_limit: usize,
 ) -> Result<Vec<SqlExpr>, String> {
+    generate_equivalent_where_clauses_impl(where_expr, source_sql, max_variants, iter_limit, 0)
+}
+
+fn generate_equivalent_where_clauses_impl(
+    where_expr: &SqlExpr,
+    source_sql: &str,
+    max_variants: usize,
+    iter_limit: usize,
+    depth: usize,
+) -> Result<Vec<SqlExpr>, String> {
+    // Subquery decomposition must come first: a predicate shaped around IN (SELECT), EXISTS or a
+    // scalar subquery is one opaque Symbol to the language, so without this branch its own WHERE
+    // is never seen by any rule. Each inner variant has already passed validation on its own, and
+    // the subquery's other clauses stay untouched, so the outer predicate keeps its shape and its
+    // semantics. Decomposition does not copy the subquery, so a predicate whose outer text
+    // contains random() is still safe here; the recursion applies the nondeterminism check to the
+    // inner predicate itself.
+    if let Some(variants) =
+        try_subquery_variants(where_expr, source_sql, max_variants, iter_limit, depth)
+    {
+        return Ok(variants);
+    }
+
     let (recexpr, symbols) = sql_expr_to_recexpr(where_expr, source_sql);
 
     // A predicate that can answer differently each time it is evaluated may not be written down
@@ -2701,6 +2856,65 @@ mod tests {
         let sql = "SELECT * FROM t0 WHERE c0 IN (SELECT c1 FROM t1)";
         assert_eq!(identity_variants(&parse_predicate(sql), sql, 2).len(), 2);
         assert!(identity_variants(&parse_predicate(sql), sql, 0).is_empty());
+    }
+
+    #[test]
+    fn an_in_subquery_with_a_rewritable_where_gets_inner_variants() {
+        let sql = "SELECT * FROM t0 WHERE c0 IN (SELECT c1 FROM t1 WHERE c1 = 5 AND c1 < 10)";
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
+        assert!(
+            !variants.is_empty(),
+            "an IN (SELECT) whose WHERE is rewritable gets inner variants"
+        );
+        for v in &variants {
+            let s = v.to_string();
+            assert!(s.contains("SELECT"), "variant keeps the subquery: {s}");
+            assert!(s.contains("IN ("), "variant keeps the IN shape: {s}");
+        }
+    }
+
+    #[test]
+    fn an_exists_with_a_rewritable_where_gets_inner_variants() {
+        let sql = "SELECT * FROM t0 WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.x = c0 AND t1.y > 5)";
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
+        assert!(!variants.is_empty(), "EXISTS with a rewritable WHERE gets inner variants");
+        for v in &variants {
+            let s = v.to_string();
+            assert!(s.contains("EXISTS"), "variant keeps EXISTS: {s}");
+            assert!(s.contains("SELECT"), "variant keeps the subquery: {s}");
+        }
+    }
+
+    #[test]
+    fn a_subquery_without_where_still_falls_back_to_identity() {
+        let sql = "SELECT * FROM t0 WHERE c0 IN (SELECT c1 FROM t1)";
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
+        assert_eq!(variants.len(), 3, "no inner WHERE, so the identity fallback applies");
+    }
+
+    #[test]
+    fn not_wrapped_insubquery_keeps_its_not() {
+        let sql = "SELECT * FROM t0 WHERE NOT (c0 IN (SELECT c1 FROM t1 WHERE c1 = 5 AND c1 < 10))";
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
+        assert!(!variants.is_empty());
+        for v in &variants {
+            let s = v.to_string();
+            assert!(s.contains("NOT"), "the outer NOT survives the rewrite: {s}");
+        }
+    }
+
+    #[test]
+    fn nested_subqueries_do_not_explode() {
+        let sql = "SELECT * FROM t0 WHERE c0 IN (SELECT c1 FROM t1 WHERE c1 IN (SELECT c2 FROM t2 WHERE c2 > 1 AND c2 < 9))";
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
+        for v in &variants {
+            assert!(v.to_string().contains("SELECT"), "variants stay well-formed");
+        }
     }
 
     /// Evaluates a WHERE text with no free symbols, the way the rule checker does.
