@@ -924,7 +924,13 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
             String projection = Randomly.getBooleanWithRatherLowProbability()
                     ? Randomly.fromOptions("min", "max") + "(" + alias + "." + quoteIdentifier(first.getName()) + ")"
                     : alias + "." + quoteIdentifier(first.getName());
-            String subquery = "SELECT " + projection + " FROM " + quotedTable + " AS " + alias;
+            // The inner WHERE is what the server's subquery decomposition rewrites: without one, the
+            // IN (SELECT ...) predicate is one opaque symbol and every check gets only the three
+            // identity variants. It must stay satisfiable by construction so the outer IN keeps
+            // returning rows - see generateSubqueryInnerWhere. The row-value form above gets no
+            // inner WHERE on purpose: the server's row-value gate rejects every variant of it.
+            String subquery = "SELECT " + projection + " FROM " + quotedTable + " AS " + alias + " WHERE "
+                    + generateSubqueryInnerWhere(table, first, second, alias);
             predicate = new SQLite3Expression.InOperation(new SQLite3ColumnName(first, null),
                     new SQLite3Expression.Subquery(subquery));
         }
@@ -933,6 +939,20 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
             predicate = new Sqlite3BinaryOperation(predicate, gen.generateBooleanExpression(), BinaryOperator.AND);
         }
         return predicate;
+    }
+
+    private static String generateSubqueryInnerWhere(SQLite3Table table, SQLite3Column first,
+            SQLite3Column second, String alias) {
+        String firstCol = alias + "." + quoteIdentifier(first.getName());
+        if (second != null && !second.getName().equals(first.getName()) && Randomly.getBoolean()) {
+            // A pure OR of equalities over the same left operand: the shape the OR-to-IN optimization
+            // rewrites into IN, where the reported collation bugs live. The first term also makes the
+            // predicate satisfiable by construction - any row whose column is not NULL satisfies it.
+            return firstCol + " = " + firstCol + " OR " + firstCol + " = "
+                    + alias + "." + quoteIdentifier(second.getName());
+        }
+        // A three-valued tautology: the IS NULL arm covers the rows the self-equality misses.
+        return firstCol + " = " + firstCol + " OR " + firstCol + " IS NULL";
     }
 
     private static SQLite3Expression generatePartialIndexWhere(PartialIndexPredicate prepared,
