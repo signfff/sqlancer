@@ -4,7 +4,7 @@ use axum::{extract::Json, http::StatusCode, response::IntoResponse, routing::pos
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sql_rewrite::generate_equivalent_where_clauses;
-use sqlparser::ast::{Query, Select, SetExpr, Statement};
+use sqlparser::ast::{Query, Select, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::net::SocketAddr;
@@ -222,27 +222,58 @@ fn generate_select_variants(
     max_variants: usize,
     source_sql: &str,
 ) -> Result<Vec<String>, String> {
-    let selection = match &select.selection {
-        Some(sel) => sel,
-        None => return Ok(Vec::new()),
-    };
+    let mut variant_queries: Vec<Query> = Vec::new();
 
     // Row values get no variants at all - see contains_row_value for why every rule that is sound
     // for scalars stops being sound once an operand is a tuple.
-    if sql_rewrite::contains_row_value(selection) {
-        return Ok(Vec::new());
-    }
-
-    let variants = generate_equivalent_where_clauses(selection, source_sql, max_variants, 20)?;
-
-    let original_str = query.to_string();
-    Ok(variants
-        .into_iter()
-        .filter_map(|expr| {
+    if let Some(selection) = &select.selection {
+        if sql_rewrite::contains_row_value(selection) {
+            return Ok(Vec::new());
+        }
+        for expr in generate_equivalent_where_clauses(selection, source_sql, max_variants, 20)? {
             let mut variant_query = query.clone();
             if let SetExpr::Select(variant_select) = &mut *variant_query.body {
                 variant_select.selection = Some(expr);
             }
+            variant_queries.push(variant_query);
+        }
+    }
+
+    // Subqueries in the SELECT list: their WHERE is rewritten and nothing else, so each projected
+    // value stays the same. This is what reaches a query with no WHERE of its own, and bugs that
+    // show up only in the projection (8ebae091a9, 1b94275d20). Leftover room only, so a query with
+    // a rewritable WHERE keeps the variants it had.
+    for (i, item) in select.projection.iter().enumerate() {
+        if variant_queries.len() >= max_variants {
+            break;
+        }
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        if sql_rewrite::contains_row_value(expr) {
+            continue;
+        }
+        let room = max_variants - variant_queries.len();
+        for v in sql_rewrite::value_subquery_variants(expr, source_sql, room, 20) {
+            let mut variant_query = query.clone();
+            if let SetExpr::Select(variant_select) = &mut *variant_query.body {
+                variant_select.projection[i] = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => SelectItem::ExprWithAlias {
+                        expr: v,
+                        alias: alias.clone(),
+                    },
+                    _ => SelectItem::UnnamedExpr(v),
+                };
+            }
+            variant_queries.push(variant_query);
+        }
+    }
+
+    let original_str = query.to_string();
+    Ok(variant_queries
+        .into_iter()
+        .filter_map(|variant_query| {
             let s = restore_integer_hex(&variant_query.to_string(), source_sql);
             if s == original_str {
                 None

@@ -1,6 +1,9 @@
 use egg::{rewrite, EGraph, FromOp, Id, Language, RecExpr, Rewrite, Runner};
 use rusqlite::Connection;
-use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Query, SetExpr, UnaryOperator};
+use sqlparser::ast::{
+    BinaryOperator, Expr as SqlExpr, GroupByExpr, Ident, OrderByKind, Query, SelectItem, SetExpr,
+    UnaryOperator,
+};
 use sqlparser::tokenizer::Span;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -2561,6 +2564,96 @@ fn subquery_selection(query: &Query) -> Option<&SqlExpr> {
     }
 }
 
+/// How the enclosing expression consumes a subquery's rows.
+#[derive(Clone, Copy, PartialEq)]
+enum SubqueryUse {
+    /// `x IN (SELECT ...)`: only the set of rows matters.
+    Set,
+    /// `(SELECT ...)` as a value: SQLite takes the first row, an implicit LIMIT 1.
+    Scalar,
+}
+
+/// Aggregates whose answer does not depend on the order rows arrive in. min/max are here although
+/// two values equal under a column's collation ('A' and 'a' under NOCASE) tie and either may win;
+/// the random path already relies on them in IN subqueries and no such tie has been seen to matter.
+const ORDER_FREE_AGGREGATES: [&str; 3] = ["count(", "min(", "max("];
+
+/// Aggregates, window functions and nondeterministic calls whose answer changes with the row order
+/// or from one evaluation to the next. Sums of REAL values round differently in another order.
+const ORDER_SENSITIVE_MARKERS: [&str; 8] = [
+    "group_concat(",
+    "string_agg(",
+    "json_group_array(",
+    "json_group_object(",
+    "sum(",
+    "avg(",
+    "total(",
+    " over ",
+];
+
+/// Whether a subquery answers the same whichever plan runs it. Rewriting its WHERE exists to
+/// change the plan, so anything the plan decides becomes a false positive: `(SELECT a FROM t WHERE
+/// b > 0)` returned 2 on 3.53.4 and the same subquery with `NOT (NOT (b > 0))` returned 1, because
+/// "the first row" is whichever row the chosen plan reaches first. A set consumer does not care
+/// about order until a LIMIT picks some rows out of it; a scalar consumer always picks one.
+///
+/// A picked row is only determined when the query is an aggregate without GROUP BY (it has exactly
+/// one row) or when its ORDER BY names every projected expression, so rows tying on the sort key
+/// project the same values. The textual ORDER BY match is conservative: `ORDER BY 1` or an alias
+/// fails it and the subquery is left alone.
+fn subquery_is_plan_independent(query: &Query, usage: SubqueryUse) -> bool {
+    let select = match query.body.as_ref() {
+        SetExpr::Select(select) => select,
+        _ => return false,
+    };
+    let mut projected = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                projected.push(e.to_string().to_lowercase())
+            }
+            _ => return false,
+        }
+    }
+    let unsafe_marker = |text: &str| {
+        ORDER_SENSITIVE_MARKERS.iter().any(|m| text.contains(m))
+            || NONDETERMINISTIC_MARKERS.iter().any(|m| text.contains(m))
+    };
+    if projected.iter().any(|p| unsafe_marker(p)) {
+        return false;
+    }
+    let is_aggregate_call = |p: &String| {
+        ORDER_FREE_AGGREGATES.iter().any(|a| p.starts_with(a)) && p.ends_with(')')
+    };
+    let mentions_aggregate = projected
+        .iter()
+        .any(|p| ORDER_FREE_AGGREGATES.iter().any(|a| p.contains(a)));
+    let grouped = !matches!(&select.group_by, GroupByExpr::Expressions(v, _) if v.is_empty())
+        || select.having.is_some();
+    if grouped {
+        // Which row a bare column comes from inside a group is the plan's choice again.
+        return false;
+    }
+    // With an aggregate in the projection, a bare column beside it takes its value from an
+    // arbitrary row of the table - the query has one row, but not a determined one.
+    let single_row = mentions_aggregate && projected.iter().all(is_aggregate_call);
+    if mentions_aggregate && !single_row {
+        return false;
+    }
+
+    let picks_rows = usage == SubqueryUse::Scalar || query.limit_clause.is_some();
+    if !picks_rows || single_row {
+        return true;
+    }
+    let ordered: HashSet<String> = match query.order_by.as_ref().map(|o| &o.kind) {
+        Some(OrderByKind::Expressions(list)) => {
+            list.iter().map(|o| o.expr.to_string().to_lowercase()).collect()
+        }
+        _ => return false,
+    };
+    projected.iter().all(|p| ordered.contains(p))
+}
+
 fn with_selection(query: &Query, new_selection: SqlExpr) -> Box<Query> {
     let mut q = query.clone();
     if let SetExpr::Select(sel) = q.body.as_mut() {
@@ -2608,18 +2701,20 @@ fn try_subquery_variants(
         }
     }
 
-    let (inner_pred, rebuild): (&SqlExpr, Box<dyn Fn(SqlExpr) -> SqlExpr>) = match cur {
+    let (subquery, rebuild): (&Query, Box<dyn Fn(SqlExpr) -> SqlExpr>) = match cur {
         SqlExpr::InSubquery {
             expr,
             subquery,
             negated,
         } => {
-            let inner = subquery_selection(subquery)?;
+            if !subquery_is_plan_independent(subquery, SubqueryUse::Set) {
+                return None;
+            }
             let left = (**expr).clone();
             let q = (**subquery).clone();
             let neg = *negated;
             (
-                inner,
+                subquery.as_ref(),
                 Box::new(move |p: SqlExpr| SqlExpr::InSubquery {
                     expr: Box::new(left.clone()),
                     subquery: with_selection(&q, p),
@@ -2628,11 +2723,10 @@ fn try_subquery_variants(
             )
         }
         SqlExpr::Exists { subquery, negated } => {
-            let inner = subquery_selection(subquery)?;
             let q = (**subquery).clone();
             let neg = *negated;
             (
-                inner,
+                subquery.as_ref(),
                 Box::new(move |p: SqlExpr| SqlExpr::Exists {
                     subquery: with_selection(&q, p),
                     negated: neg,
@@ -2640,24 +2734,32 @@ fn try_subquery_variants(
             )
         }
         SqlExpr::Subquery(q) => {
-            let inner = subquery_selection(q)?;
-            let q = (**q).clone();
+            if !subquery_is_plan_independent(q, SubqueryUse::Scalar) {
+                return None;
+            }
+            let owned = (**q).clone();
             (
-                inner,
-                Box::new(move |p: SqlExpr| SqlExpr::Subquery(with_selection(&q, p))),
+                q.as_ref(),
+                Box::new(move |p: SqlExpr| SqlExpr::Subquery(with_selection(&owned, p))),
             )
         }
         _ => return None,
     };
 
-    let inner_variants = generate_equivalent_where_clauses_impl(
-        inner_pred,
-        source_sql,
-        max_variants,
-        iter_limit,
-        depth + 1,
-    )
-    .ok()?;
+    let inner_variants = match subquery_selection(subquery) {
+        Some(inner_pred) => generate_equivalent_where_clauses_impl(
+            inner_pred,
+            source_sql,
+            max_variants,
+            iter_limit,
+            depth + 1,
+        )
+        .ok()?,
+        // No WHERE to rewrite, but giving the subquery one that every row satisfies still changes
+        // what the planner does with it: measured on 3.53.4, `20 IN (SELECT y FROM t2)` over a
+        // DESC index ignores the NULL in t2 (b16fe2bff5) and `... WHERE 1` does not.
+        None => vec![SqlExpr::Value(sqlparser::ast::Value::Number("1".to_string(), false).into())],
+    };
     if inner_variants.is_empty() {
         return None;
     }
@@ -2677,6 +2779,97 @@ fn try_subquery_variants(
             })
             .collect(),
     )
+}
+
+/// Variants of a value expression - a SELECT-list item - obtained by rewriting the WHERE of one
+/// subquery inside it. Only inner WHEREs are touched: the identities used on predicates
+/// (`NOT (NOT p)`, `p AND p`) turn a value into 0/1 and would change what is projected. Each variant
+/// rewrites the first subquery, walking left to right, that yields any.
+pub fn value_subquery_variants(
+    expr: &SqlExpr,
+    source_sql: &str,
+    max_variants: usize,
+    iter_limit: usize,
+) -> Vec<SqlExpr> {
+    if max_variants == 0 {
+        return Vec::new();
+    }
+    match expr {
+        SqlExpr::InSubquery { .. } | SqlExpr::Exists { .. } | SqlExpr::Subquery(_) => {
+            try_subquery_variants(expr, source_sql, max_variants, iter_limit, 0).unwrap_or_default()
+        }
+        SqlExpr::Nested(inner) => value_subquery_variants(inner, source_sql, max_variants, iter_limit)
+            .into_iter()
+            .map(|v| SqlExpr::Nested(Box::new(v)))
+            .collect(),
+        SqlExpr::UnaryOp { op, expr: inner } => {
+            value_subquery_variants(inner, source_sql, max_variants, iter_limit)
+                .into_iter()
+                .map(|v| SqlExpr::UnaryOp {
+                    op: op.clone(),
+                    expr: Box::new(v),
+                })
+                .collect()
+        }
+        SqlExpr::IsNull(inner) => value_subquery_variants(inner, source_sql, max_variants, iter_limit)
+            .into_iter()
+            .map(|v| SqlExpr::IsNull(Box::new(v)))
+            .collect(),
+        SqlExpr::IsNotNull(inner) => {
+            value_subquery_variants(inner, source_sql, max_variants, iter_limit)
+                .into_iter()
+                .map(|v| SqlExpr::IsNotNull(Box::new(v)))
+                .collect()
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let lefts = value_subquery_variants(left, source_sql, max_variants, iter_limit);
+            if !lefts.is_empty() {
+                return lefts
+                    .into_iter()
+                    .map(|v| SqlExpr::BinaryOp {
+                        left: Box::new(v),
+                        op: op.clone(),
+                        right: right.clone(),
+                    })
+                    .collect();
+            }
+            value_subquery_variants(right, source_sql, max_variants, iter_limit)
+                .into_iter()
+                .map(|v| SqlExpr::BinaryOp {
+                    left: left.clone(),
+                    op: op.clone(),
+                    right: Box::new(v),
+                })
+                .collect()
+        }
+        SqlExpr::Function(f) => {
+            use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+            let FunctionArguments::List(list) = &f.args else {
+                return Vec::new();
+            };
+            for (i, arg) in list.args.iter().enumerate() {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg else {
+                    continue;
+                };
+                let variants = value_subquery_variants(e, source_sql, max_variants, iter_limit);
+                if variants.is_empty() {
+                    continue;
+                }
+                return variants
+                    .into_iter()
+                    .map(|v| {
+                        let mut g = f.clone();
+                        if let FunctionArguments::List(l) = &mut g.args {
+                            l.args[i] = FunctionArg::Unnamed(FunctionArgExpr::Expr(v));
+                        }
+                        SqlExpr::Function(g)
+                    })
+                    .collect();
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 pub fn generate_equivalent_where_clauses(
@@ -2702,10 +2895,22 @@ fn generate_equivalent_where_clauses_impl(
     // semantics. Decomposition does not copy the subquery, so a predicate whose outer text
     // contains random() is still safe here; the recursion applies the nondeterminism check to the
     // inner predicate itself.
-    if let Some(variants) =
+    // Room left over goes to the whole-predicate identities, which were all a subquery without an
+    // inner WHERE used to get; this is a WHERE, so they are as sound here as anywhere.
+    if let Some(mut variants) =
         try_subquery_variants(where_expr, source_sql, max_variants, iter_limit, depth)
     {
+        if variants.len() < max_variants {
+            let room = max_variants - variants.len();
+            variants.extend(identity_variants(where_expr, source_sql, room));
+        }
         return Ok(variants);
+    }
+
+    // The entry point refuses row values outright (see contains_row_value); a subquery's own WHERE
+    // reaches this function without passing that gate, so it is applied again here.
+    if depth > 0 && contains_row_value(where_expr) {
+        return Ok(Vec::new());
     }
 
     let (recexpr, symbols) = sql_expr_to_recexpr(where_expr, source_sql);
@@ -2888,11 +3093,107 @@ mod tests {
     }
 
     #[test]
-    fn a_subquery_without_where_still_falls_back_to_identity() {
+    fn a_subquery_without_where_gets_an_always_true_one_and_the_identities() {
         let sql = "SELECT * FROM t0 WHERE c0 IN (SELECT c1 FROM t1)";
         let variants =
             generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
-        assert_eq!(variants.len(), 3, "no inner WHERE, so the identity fallback applies");
+        let rendered: Vec<String> = variants.iter().map(|v| v.to_string()).collect();
+        assert_eq!(rendered.len(), 4, "{:?}", rendered);
+        assert_eq!(rendered[0], "c0 IN (SELECT c1 FROM t1 WHERE 1)");
+        assert!(rendered[1].starts_with("NOT (NOT ("), "{:?}", rendered);
+    }
+
+    /// Whether the subquery gets decomposed: through the SELECT-list entry point when the SQL
+    /// starts with a projected subquery, through the WHERE one otherwise.
+    fn scalar_subquery_is_decomposed(sql: &str) -> bool {
+        if sql.starts_with("SELECT (") {
+            return !value_subquery_variants(&parse_projection(sql), sql, 8, 20).is_empty();
+        }
+        try_subquery_variants(&parse_predicate(sql), sql, 8, 20, 0).is_some()
+    }
+
+    #[test]
+    fn a_scalar_subquery_whose_first_row_the_plan_picks_is_left_alone() {
+        // 3.53.4: this subquery answered 2, and 1 once its WHERE became NOT (NOT (b > 0)).
+        assert!(!scalar_subquery_is_decomposed(
+            "SELECT (SELECT a FROM t WHERE b > 0) FROM t0"
+        ));
+        // Ordered, but not by what it projects: rows tying on b may differ in a.
+        assert!(!scalar_subquery_is_decomposed(
+            "SELECT (SELECT a FROM t WHERE b > 0 ORDER BY b LIMIT 1) FROM t0"
+        ));
+    }
+
+    #[test]
+    fn a_scalar_subquery_with_a_determined_first_row_is_decomposed() {
+        assert!(scalar_subquery_is_decomposed(
+            "SELECT (SELECT a FROM t WHERE b > 0 ORDER BY b, a LIMIT 1) FROM t0"
+        ));
+        assert!(scalar_subquery_is_decomposed(
+            "SELECT (SELECT count(*) FROM t WHERE b > 0) FROM t0"
+        ));
+    }
+
+    #[test]
+    fn order_sensitive_or_limited_set_subqueries_are_left_alone() {
+        for sql in [
+            "SELECT * FROM t0 WHERE c0 IN (SELECT a FROM t WHERE b > 0 LIMIT 2)",
+            "SELECT * FROM t0 WHERE c0 IN (SELECT group_concat(a) FROM t WHERE b > 0)",
+            "SELECT * FROM t0 WHERE c0 IN (SELECT a + count(*) FROM t WHERE b > 0)",
+            "SELECT * FROM t0 WHERE c0 IN (SELECT a FROM t WHERE b > 0 GROUP BY b)",
+        ] {
+            assert!(!scalar_subquery_is_decomposed(sql), "{sql}");
+        }
+        assert!(scalar_subquery_is_decomposed(
+            "SELECT * FROM t0 WHERE c0 IN (SELECT max(a) FROM t WHERE b > 0)"
+        ));
+    }
+
+    fn parse_projection(sql: &str) -> SqlExpr {
+        use sqlparser::ast::{SelectItem, SetExpr, Statement};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parses");
+        let Statement::Query(query) = &statements[0] else { panic!("not a query") };
+        let SetExpr::Select(select) = query.body.as_ref() else { panic!("not a SELECT") };
+        match &select.projection[0] {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e.clone(),
+            _ => panic!("not an expression"),
+        }
+    }
+
+    #[test]
+    fn a_projected_subquery_gets_its_where_rewritten_and_nothing_else() {
+        // 8ebae091a9: on 3.53.4 this answers '1', and ' 1' once the WHERE is NOT (NOT (...)).
+        let sql = "SELECT (SELECT s.c1 FROM t3 s WHERE a.k = s.c1 ORDER BY s.c1 LIMIT 1) FROM t0 a";
+        let variants = value_subquery_variants(&parse_projection(sql), sql, 8, 20);
+        assert!(!variants.is_empty());
+        for v in &variants {
+            let s = v.to_string();
+            assert!(s.starts_with("(SELECT s.c1 FROM t3 s WHERE "), "value keeps its shape: {s}");
+            assert!(s.ends_with("ORDER BY s.c1 LIMIT 1)"), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_subquery_inside_a_projected_expression_is_reached() {
+        let sql = "SELECT abs((SELECT count(*) FROM t WHERE t.a > 1 AND t.a < 9)) + 1 FROM t0";
+        let variants = value_subquery_variants(&parse_projection(sql), sql, 8, 20);
+        assert!(!variants.is_empty());
+        for v in &variants {
+            let s = v.to_string();
+            assert!(s.starts_with("abs((SELECT count(*) FROM t WHERE "), "{s}");
+            assert!(s.ends_with(")) + 1"), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_projected_value_never_gets_a_predicate_identity() {
+        // NOT (NOT x) would project 0/1 instead of x.
+        let sql = "SELECT (SELECT a FROM t ORDER BY a LIMIT 1) FROM t0";
+        let variants = value_subquery_variants(&parse_projection(sql), sql, 8, 20);
+        let rendered: Vec<String> = variants.iter().map(|v| v.to_string()).collect();
+        assert_eq!(rendered, vec!["(SELECT a FROM t WHERE 1 ORDER BY a LIMIT 1)".to_string()]);
     }
 
     #[test]

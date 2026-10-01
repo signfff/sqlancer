@@ -54,4 +54,12 @@ public class TestSQLite3EGraphInputCorpus {
         assertTrue(SQLite3EGraphInputCorpus.isSafeEGraphQueryInput("SELECT * FROM t0 WHERE c0 = 'x''7979'''"));
         assertTrue(SQLite3EGraphInputCorpus.isSafeEGraphQueryInput("SELECT \"x'7979\" FROM t0 WHERE c0 <= 1"));
     }
+
+    @Test
+    public void testQueryWithoutWhereNeedsASubqueryToRewrite() {
+        assertFalse(SQLite3EGraphInputCorpus.isSafeEGraphQueryInput("SELECT c0 FROM t0"));
+        assertTrue(SQLite3EGraphInputCorpus.isSafeEGraphQueryInput(
+                "SELECT (SELECT s.c1 FROM t3 s WHERE a.k = s.c1 ORDER BY s.c1 LIMIT 1) FROM t0 a"));
+        assertTrue(SQLite3EGraphInputCorpus.isSafeEGraphQueryInput("SELECT 20 IN (SELECT y FROM t2)"));
+    }
 }

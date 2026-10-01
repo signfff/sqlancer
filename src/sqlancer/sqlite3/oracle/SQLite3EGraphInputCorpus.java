@@ -156,7 +156,9 @@ public final class SQLite3EGraphInputCorpus {
         if (!normalized.startsWith("SELECT ") && !normalized.startsWith("SELECT\n")) {
             return "not-select";
         }
-        if (!(" " + normalized + " ").contains(" WHERE ")) {
+        // Without a WHERE the server can still rewrite the WHERE of a subquery in the SELECT list, so
+        // a query carrying a subquery comes in; the server hands back no variants when it cannot.
+        if (!(" " + normalized + " ").contains(" WHERE ") && !normalized.contains("(SELECT ")) {
             return "no-where";
         }
         if (normalized.matches(".*\\bSQLITE_(TEMP_)?(MASTER|SCHEMA|STAT1|STAT4)\\b.*")) {
