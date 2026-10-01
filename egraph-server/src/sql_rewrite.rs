@@ -607,15 +607,12 @@ pub fn contains_row_value(expr: &SqlExpr) -> bool {
         | SqlExpr::IsNotFalse(inner)
         | SqlExpr::IsUnknown(inner)
         | SqlExpr::IsNotUnknown(inner) => contains_row_value(inner),
-        // An IN is where the row-value reports actually live - `(a, b) IN (SELECT ...)` is the shape
-        // of the min() report this tool rediscovered on its own. These two arms were missing, so a
-        // tuple hiding in an IN reached the rules that the arms above exist to keep it away from.
-        SqlExpr::InList {
-            expr: inner, list, ..
-        } => {
-            contains_row_value(inner) || list.iter().any(contains_row_value)
-        }
-        SqlExpr::InSubquery { expr: inner, .. } => contains_row_value(inner),
+        // An IN is not walked, on purpose. The converter keeps `(a, b) IN (...)` whole as one opaque
+        // atom whose value is a plain truth value, so no comparison rule ever sees the tuple: what
+        // reaches the atom is the identities and the boolean rules around it, and those hold for
+        // any three-valued predicate whatever its operands. IN arms were once added here on that
+        // worry alone, with no mismatch behind them, and they switched off the one shape - the
+        // row-value IN with min() of 6c97dbe469 - that the random path had found a real bug with.
         _ => false,
     }
 }
@@ -2907,7 +2904,7 @@ fn generate_equivalent_where_clauses_impl(
         return Ok(variants);
     }
 
-    // The entry point refuses row values outright (see contains_row_value); a subquery's own WHERE
+    // The entry point refuses row-value comparisons (see contains_row_value); a subquery's own WHERE
     // reaches this function without passing that gate, so it is applied again here.
     if depth > 0 && contains_row_value(where_expr) {
         return Ok(Vec::new());
@@ -3184,6 +3181,40 @@ mod tests {
             let s = v.to_string();
             assert!(s.starts_with("abs((SELECT count(*) FROM t WHERE "), "{s}");
             assert!(s.ends_with(")) + 1"), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_row_value_is_refused_where_it_is_an_operand_and_nowhere_else() {
+        for sql in [
+            "SELECT * FROM t0 WHERE (c0, c1) <> ('45', '46')",
+            "SELECT * FROM t0 WHERE NOT (('45', '46') BETWEEN (c0, c1) AND (c0, c1))",
+            "SELECT * FROM t0 WHERE c2 > 1 AND (c0, c1) = (1, 2)",
+        ] {
+            assert!(contains_row_value(&parse_predicate(sql)), "{sql}");
+        }
+        for sql in [
+            "SELECT c1 FROM t0 WHERE (((c1),(c1)) IN (SELECT c.c1, min(c.c1) FROM t0 AS c))",
+            "SELECT * FROM t0 WHERE (c0, c1) IN ((1, 2), (3, 4))",
+            "SELECT * FROM t0 WHERE c2 > 1 AND (c0, c1) IN (SELECT a, b FROM t1)",
+        ] {
+            assert!(!contains_row_value(&parse_predicate(sql)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_row_value_in_gets_variants_that_leave_the_in_whole() {
+        // 6c97dbe469: on 3.53.4 the base returns no row and NOT (NOT (...)) returns -1.
+        let sql = "SELECT c1 FROM t0 WHERE (((c1),(c1)) IN (SELECT c.c1, min(c.c1) FROM t0 AS c))";
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 8, 20).expect("generates");
+        assert!(!variants.is_empty());
+        for v in &variants {
+            let s = v.to_string();
+            assert!(
+                s.contains("((c1), (c1)) IN (SELECT c.c1, min(c.c1) FROM t0 AS c)"),
+                "the IN atom is untouched: {s}"
+            );
         }
     }
 

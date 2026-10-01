@@ -30,6 +30,9 @@ def build_args(corpus, seconds, workdir):
             continue  # no shape steering: the corpus query is what is under test
         out.append(line)
     out.insert(1, "-Dsqlite3.egraph.corpus.allowJoin=true")
+    # Every case here is a known bug, so the known-bug signatures would swallow exactly the hits
+    # this bench counts (6c97dbe469 is one of them).
+    out.insert(1, "-Degraph.knownBugs=false")
     if os.environ.get("ALLOW_EMPTY_BASE") == "1":
         out.insert(1, "-Dsqlite3.egraph.corpus.allowEmptyBase=true")
     out.insert(1, "-Dsqlite3.egraph.corpusSetupOnly=true")

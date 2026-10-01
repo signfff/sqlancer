@@ -224,8 +224,8 @@ fn generate_select_variants(
 ) -> Result<Vec<String>, String> {
     let mut variant_queries: Vec<Query> = Vec::new();
 
-    // Row values get no variants at all - see contains_row_value for why every rule that is sound
-    // for scalars stops being sound once an operand is a tuple.
+    // A WHERE that compares row values gets no variants at all - see contains_row_value for why
+    // every rule that is sound for scalars stops being sound once an operand is a tuple.
     if let Some(selection) = &select.selection {
         if sql_rewrite::contains_row_value(selection) {
             return Ok(Vec::new());
