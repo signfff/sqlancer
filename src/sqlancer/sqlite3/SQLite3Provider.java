@@ -133,13 +133,13 @@ public class SQLite3Provider extends SQLProviderAdapter<SQLite3GlobalState, SQLi
      * Ordinary tables EGRAPH creates, on top of the R-Tree when egraph.rtreeTargets is on.
      *
      * <p>
-     * 1 keeps the historical behaviour. Useful values are 3 and up, and only together with
-     * egraph.joinPercent: the reports this exists for need three tables joined in a nest, and a
-     * single extra table measurably bought nothing when tried on its own.
+     * 3 by default, to go with egraph.joinPercent: the reports this exists for need three tables
+     * joined in a nest, and a single extra table measurably bought nothing when tried on its own.
+     * 1 restores the historical single-table database.
      * </p>
      */
     private static final int EGRAPH_TABLES = Math.max(1,
-            Integer.parseInt(System.getProperty("egraph.tables", "1")));
+            Integer.parseInt(System.getProperty("egraph.tables", "3")));
 
     /**
      * Multiplier for the per-action budgets, which are totals across tables rather than per-table

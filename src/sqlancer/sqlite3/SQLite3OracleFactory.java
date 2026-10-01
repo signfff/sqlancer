@@ -714,11 +714,14 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
      * </p>
      *
      * <p>
-     * 0 keeps the previous behaviour. Left at 0 until an A/B says otherwise.
+     * On by default since an A/B that counted findings as well as throughput (2026-09-30, seeds 7
+     * and 11, trunk referee on): no mismatch of ours, and 90-95% of the checks on this path saw the
+     * rewrite change the plan. The earlier A/B that left it at 0 ran while findings were discarded,
+     * so it had only ever measured throughput.
      * </p>
      */
     private static final int PARTIAL_INDEX_PERCENT = Integer
-            .parseInt(System.getProperty("egraph.partialIndexPercent", "0"));
+            .parseInt(System.getProperty("egraph.partialIndexPercent", "30"));
 
     /**
      * Percentage of base queries that span more than one table.
@@ -733,18 +736,21 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
      * </p>
      *
      * <p>
-     * Measured before writing this: duplicate column names across joined tables are not a problem -
-     * SQLite disambiguates them ({@code c0,c1,c0:1,c1:1}) and all seven wrapper shapes accept the
-     * result. An INNER JOIN with an unsatisfiable ON does collapse to zero rows and gets dropped by
+     * Duplicate column names across joined tables: SQLite disambiguates them ({@code c0,c1,c0:1,c1:1})
+     * and every wrapper shape accepts the result, but GROUP BY over the tables' column names then
+     * groups by the first copy only - see createEGraphCoverageContext, which falls back to DISTINCT.
+     * An INNER JOIN with an unsatisfiable ON does collapse to zero rows and gets dropped by
      * the non-empty probe, but an outer join does not, which happens to make RIGHT JOIN the
      * cheapest of these to reach.
      * </p>
      *
      * <p>
-     * 0 keeps the previous single-table behaviour. Left at 0 until an A/B says otherwise.
+     * On by default, together with egraph.tables=3, since the 2026-09-30 A/B: no mismatch of ours
+     * once the GROUP BY wrapper stopped merging rows, and no loss of throughput. 0 restores the
+     * single-table base query.
      * </p>
      */
-    private static final int JOIN_PERCENT = Integer.parseInt(System.getProperty("egraph.joinPercent", "0"));
+    private static final int JOIN_PERCENT = Integer.parseInt(System.getProperty("egraph.joinPercent", "30"));
 
     /** A partial index plus the exact predicate tree it was created with. */
     private static final class PartialIndexPredicate {
@@ -2126,6 +2132,14 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
         if ((shape == EGraphCoverageShape.MULTI_INDEX_OR || shape == EGraphCoverageShape.AUTOMATIC_INDEX)
                 && columns.size() < 2) {
             shape = EGraphCoverageShape.PLAIN;
+        }
+        // GROUP BY over every column stands in for DISTINCT, which it is paired against. A joined
+        // base query projects every table's columns, and generated tables share names: SQLite renames
+        // the repeats to c0:1 and so on, so GROUP BY "c0", "c0", ... groups by the first copy only and
+        // merges rows that DISTINCT keeps apart. Measured with three joined tables: 36 rows against 77.
+        if (shape == EGraphCoverageShape.GROUP_BY && columns.stream()
+                .map(c -> c.getName().toLowerCase(java.util.Locale.ROOT)).distinct().count() < columns.size()) {
+            shape = EGraphCoverageShape.DISTINCT;
         }
         if (shape == EGraphCoverageShape.MULTI_INDEX_OR) {
             addMultiIndexOrIndexes(state, table, column, secondColumn);
