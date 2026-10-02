@@ -28,7 +28,9 @@ param(
     [string] $Gcc = "D:\Dev-Cpp\TDM-GCC-64\bin\gcc.exe",
     [string] $JdbcJar = "$env:USERPROFILE\.m2\repository\org\xerial\sqlite-jdbc\3.53.4.0\sqlite-jdbc-3.53.4.0.jar",
     # WSL directory holding a clone of https://github.com/sqlite/sqlite.git (made once with --depth 1).
-    [string] $WslSqliteDir = "~/sqlite-trunk/src"
+    [string] $WslSqliteDir = "~/sqlite-trunk/src",
+    # Build what the local clone already holds, for when GitHub cannot be reached.
+    [switch] $NoFetch
 )
 
 Set-StrictMode -Version Latest
@@ -41,9 +43,16 @@ New-Item -ItemType Directory -Force -Path $build | Out-Null
 $repo = Join-Path $OutDir "repo"
 if (-not (Test-Path (Join-Path $repo ".git"))) {
     git clone -q --depth 1 https://github.com/sqlite/sqlite.git $repo
+} elseif ($NoFetch) {
+    Write-Host "Skipping the fetch: building $(git -C $repo log -1 --format='%h %ci')"
 } else {
-    git -C $repo fetch -q --depth 1 origin master
-    git -C $repo reset -q --hard FETCH_HEAD
+    # The proxy drops a GitHub connection now and then (502, TLS reset): retry before giving up.
+    foreach ($attempt in 1..4) {
+        git -C $repo fetch -q --depth 1 origin master
+        if ($LASTEXITCODE -eq 0) { break }
+        Start-Sleep -Seconds 5
+    }
+    if ($LASTEXITCODE -eq 0) { git -C $repo reset -q --hard FETCH_HEAD }
 }
 if ($LASTEXITCODE -ne 0) { throw "fetching trunk from GitHub failed" }
 
@@ -53,7 +62,7 @@ $wslRepo = (wsl -e wslpath -a ($repo -replace '\\', '/')).Trim()
 $script = @"
 set -e
 cd $WslSqliteDir
-git fetch -q --depth 1 '$wslRepo' master
+git fetch -q --depth 1 '$wslRepo' HEAD
 git reset -q --hard FETCH_HEAD
 ./configure --update-limit > cfg-jdbc.log 2>&1
 rm -f sqlite3.c shell.c parse.c parse.h
