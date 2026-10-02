@@ -545,10 +545,11 @@ public class SQLite3Provider extends SQLProviderAdapter<SQLite3GlobalState, SQLi
         if (!Randomly.getBooleanWithSmallProbability()) {
             pragmasToExecute.addAll(DEFAULT_PRAGMAS);
         }
-        if (Randomly.getBoolean() && globalState.getDbmsSpecificOptions().oracles != SQLite3OracleFactory.PQS) {
-            // the PQS implementation currently assumes the default behavior of LIKE
-            pragmasToExecute.add("PRAGMA case_sensitive_like=ON;");
-        }
+        // PRAGMA case_sensitive_like is no longer set. It re-registers LIKE without SQLITE_DETERMINISTIC, so an
+        // index whose expression or WHERE uses LIKE turns into SQLITE_CORRUPT ("malformed database schema")
+        // the next time the schema is parsed - a long run stopped on exactly that. Upstream calls it
+        // documented behaviour of a deprecated pragma (forum d3abdc1a4d, WONT FIX), so every report it
+        // produces is one of ours. SQLite3PragmaGenerator already leaves it out for the same reason.
         if (Randomly.getBoolean() && globalState.getDbmsSpecificOptions().oracles != SQLite3OracleFactory.PQS) {
             // the encoding has an influence how binary strings are cast
             pragmasToExecute.add(String.format("PRAGMA encoding = '%s';",
