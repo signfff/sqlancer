@@ -1663,12 +1663,13 @@ fn eval(
             }
         }
 
-        //  Remainder: both operands must be integers, NULL if RHS is 0
+        //  Remainder: both operands must be integers, NULL if RHS is 0. Wrapping, like Div:
+        //  i64::MIN % -1 overflows and panics, where SQLite answers 0.
         SqlLang::Remainder([l, r]) => {
             let lv = eval(expr, *l, symbols, assignment);
             let rv = eval(expr, *r, symbols, assignment);
             match (sqlvalue_to_int(&lv), sqlvalue_to_int(&rv)) {
-                (Some(a), Some(b)) if b != 0 => SqlValue::Int(a % b),
+                (Some(a), Some(b)) if b != 0 => SqlValue::Int(a.wrapping_rem(b)),
                 _ => SqlValue::Null,
             }
         }
@@ -2869,6 +2870,20 @@ pub fn value_subquery_variants(
     }
 }
 
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a character boundary.
+/// Slicing at a fixed byte index panics when it lands inside a multi-byte character, which the
+/// generator's random strings (CJK, U+FFFF) reach.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub fn generate_equivalent_where_clauses(
     where_expr: &SqlExpr,
     source_sql: &str,
@@ -2960,7 +2975,7 @@ fn generate_equivalent_where_clauses_impl(
         // Two-tier validation: SQLite-backed (authoritative) ?in-memory (fallback)
         let var_key = format!("{}", sql_expr);
         let var_label = if var_key.len() > 120 {
-            format!("{}...", &var_key[..120])
+            format!("{}...", truncate_at_char_boundary(&var_key, 120))
         } else {
             var_key.clone()
         };
@@ -3274,6 +3289,31 @@ mod tests {
         assert_eq!(eval_predicate("5 / 0"), SqlValue::Null);
         assert_eq!(eval_predicate("5 % 0"), SqlValue::Null);
         assert_eq!(eval_predicate("6 / 3"), SqlValue::Int(2));
+    }
+
+    #[test]
+    fn the_remainder_of_the_smallest_integer_does_not_overflow() {
+        // Measured against SQLite 3.54: 0|0|-1|-1|1. i64::MIN % -1 used to panic the server.
+        assert_eq!(eval_predicate("(-9223372036854775807 - 1) % -1"), SqlValue::Int(0));
+        assert_eq!(eval_predicate("(-9223372036854775807 - 1) % 1"), SqlValue::Int(0));
+        assert_eq!(eval_predicate("(-9223372036854775807 - 1) % 7"), SqlValue::Int(-1));
+        assert_eq!(eval_predicate("-7 % 3"), SqlValue::Int(-1));
+        assert_eq!(eval_predicate("7 % -3"), SqlValue::Int(1));
+    }
+
+    #[test]
+    fn truncation_backs_off_to_a_character_boundary() {
+        assert_eq!(truncate_at_char_boundary("abc", 120), "abc");
+        assert_eq!(truncate_at_char_boundary("ab甙c", 3), "ab");
+        assert_eq!(truncate_at_char_boundary("ab甙c", 5), "ab甙");
+        assert_eq!(truncate_at_char_boundary("ab甙c", 2), "ab");
+    }
+
+    #[test]
+    fn a_variant_longer_than_the_log_label_with_a_wide_character_does_not_panic() {
+        // From the 2026-10-03 trunk run: the 120-byte label cut through 'ⱞ'.
+        let sql = "SELECT DISTINCT rt1.c1, rt1.c0 FROM rt1 WHERE (((((rt1.c2) IS TRUE))<=(CAST('YLⱞpFtWBq' AS TEXT))))";
+        generate_equivalent_where_clauses(&parse_predicate(sql), sql, 16, 20).expect("generates");
     }
 
     #[test]
