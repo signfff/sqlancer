@@ -638,8 +638,8 @@ pub fn compares_columns_of_unknown_collation(expr: &SqlExpr) -> bool {
         SqlExpr::UnaryOp { expr: inner, .. } => compares_columns_of_unknown_collation(inner),
         SqlExpr::BinaryOp { left, op, right } => {
             if is_collation_sensitive_operator(op)
-                && mentions_a_column(left)
-                && mentions_a_column(right)
+                && ((mentions_a_column(left) && mentions_a_column(right))
+                    || (carries_explicit_collation(left) && carries_explicit_collation(right)))
                 && left.to_string() != right.to_string()
             {
                 return true;
@@ -653,7 +653,10 @@ pub fn compares_columns_of_unknown_collation(expr: &SqlExpr) -> bool {
             high,
             ..
         } => {
-            if mentions_a_column(inner) && (mentions_a_column(low) || mentions_a_column(high)) {
+            if (mentions_a_column(inner) && (mentions_a_column(low) || mentions_a_column(high)))
+                || (carries_explicit_collation(inner)
+                    && (carries_explicit_collation(low) || carries_explicit_collation(high)))
+            {
                 let inner_text = inner.to_string();
                 if inner_text != low.to_string() || inner_text != high.to_string() {
                     return true;
@@ -687,8 +690,19 @@ fn is_collation_sensitive_operator(op: &BinaryOperator) -> bool {
     )
 }
 
-/// Whether a subexpression mentions a column at all. An explicit COLLATE makes the side's collation
-/// its own whichever way round it is written, so such a side is not a reason to withhold anything.
+/// Whether a side carries an explicit COLLATE anywhere. One explicit side decides the collation
+/// whichever way round it is written, but when both sides have one the left operand's wins:
+/// measured on SQLite 3.54, `('ABC' COLLATE nocase) = ('abc' COLLATE binary)` is 1 and the swapped
+/// form is 0. SQLite carries an explicit collation up through operators and function arguments
+/// (EP_Collate in sqlite3ExprCollSeq), so a COLLATE anywhere in the side counts; that can only
+/// withhold a rewrite that would have been sound. The 2026-10-03 trunk run reported
+/// `("c0" COLLATE nocase)='abc' COLLATE binary` as a mismatch before this.
+fn carries_explicit_collation(expr: &SqlExpr) -> bool {
+    expr.to_string().to_uppercase().contains(" COLLATE ")
+}
+
+/// Whether a subexpression mentions a column at all. A side whose collation is explicit is left to
+/// carries_explicit_collation.
 fn mentions_a_column(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
@@ -3384,6 +3398,44 @@ mod tests {
         assert!(make_rewrite_rules(true)
             .iter()
             .any(|r| r.name.as_str() == "eq-sym"));
+    }
+
+    #[test]
+    fn two_explicit_collations_withhold_the_swap_rules() {
+        // Measured on SQLite 3.54: `('ABC' COLLATE nocase) = ('abc' COLLATE binary)` is 1 and the
+        // swapped form is 0 - the left operand's explicit collation wins. Reported as a mismatch
+        // by the 2026-10-03 trunk run: the original found no row, the variant found 'TR'.
+        assert!(compares_columns_of_unknown_collation(&parse_predicate(
+            r#"SELECT * FROM "t0" WHERE ("c0" COLLATE nocase)='abc' COLLATE binary"#
+        )));
+        assert!(compares_columns_of_unknown_collation(&parse_predicate(
+            "SELECT 1 WHERE ('ABC' COLLATE nocase) < ('abc' COLLATE binary)"
+        )));
+        assert!(compares_columns_of_unknown_collation(&parse_predicate(
+            "SELECT 1 FROM t WHERE (a COLLATE nocase) BETWEEN ('x' COLLATE binary) AND 'z'"
+        )));
+
+        // One explicit side decides whichever way round it is written.
+        assert!(!compares_columns_of_unknown_collation(&parse_predicate(
+            "SELECT 1 FROM t WHERE (a COLLATE nocase) = 'abc'"
+        )));
+        assert!(!compares_columns_of_unknown_collation(&parse_predicate(
+            "SELECT 1 WHERE 'abc' = ('ABC' COLLATE nocase)"
+        )));
+    }
+
+    #[test]
+    fn the_reported_collation_mismatch_gets_no_swapped_variant() {
+        let sql = r#"SELECT * FROM "t0" WHERE ("c0" COLLATE nocase)='abc' COLLATE binary"#;
+        let variants =
+            generate_equivalent_where_clauses(&parse_predicate(sql), sql, 16, 20).expect("generates");
+        assert!(!variants.is_empty(), "the rules that keep the order still apply");
+        for v in &variants {
+            let s = v.to_string();
+            let binary_side = s.find("'abc' COLLATE binary").expect("keeps the literal side");
+            let nocase_side = s.find("\"c0\" COLLATE nocase").expect("keeps the column side");
+            assert!(nocase_side < binary_side, "the NOCASE side moved right: {s}");
+        }
     }
 
     #[test]
