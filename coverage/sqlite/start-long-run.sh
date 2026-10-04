@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Long EGRAPH capture on Linux: the counterpart of start-long-codecov-capture.ps1.
 #
-# Same corpus inputs and the same -D properties, with three differences:
+# Same corpus inputs and the same -D properties, with four differences:
 #   * SQLite's trunk is the system under test by default (build-trunk-jdbc.sh), and its shell is the
 #     referee. --sut bundled tests the driver's own library instead.
+#   * The heap ceiling is 32g, not 3g: a database is only replaced when it reports a mismatch, and
+#     SQLancer keeps every statement it ran to reproduce one. On the 2026-10-03 trunk run a
+#     database held 2.5 GB of them after 4 hours and filled a 3g heap.
 #   * The run directory is the working directory, so logs/, databases/ and the superjournals land in
 #     it and several runs can go side by side on one machine.
 #   * The rewrite server is started if nothing answers on :3000, and --detach leaves the run going
 #     after the ssh session ends.
 # The coverage replay (finish-long-codecov.ps1) is not ported: its instrumented build is 3.53.4.
 #
-# Usage: start-long-run.sh [--timeout SEC] [--tag TAG] [--heap 3g] [--max-corpus-queries N]
+# Usage: start-long-run.sh [--timeout SEC] [--tag TAG] [--heap 32g] [--max-corpus-queries N]
 #                          [--sut trunk|bundled] [--referee CMD|""] [--no-auto-research-corpus]
 #                          [--detach] [-Dname=value ...]
 set -euo pipefail
@@ -18,7 +21,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 
-timeout=-1 tag="" heap=3g max_corpus_queries=30000 sut=trunk no_ar_corpus=0 detach=0
+timeout=-1 tag="" heap=32g max_corpus_queries=30000 sut=trunk no_ar_corpus=0 detach=0
 trunk_build=$here/trunk-jdbc/build
 referee=$trunk_build/sqlite3_trunk
 extra=()
