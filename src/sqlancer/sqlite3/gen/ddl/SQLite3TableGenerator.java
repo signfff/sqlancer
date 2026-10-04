@@ -183,9 +183,13 @@ public class SQLite3TableGenerator {
                 columns.add(Randomly.fromList(columnNames));
             }
         } else {
+            // Not a view: a foreign key into one fails every write with "foreign key mismatch". The
+            // EGRAPH corpus leaves its own objects in the database, among them views whose repeated
+            // columns SQLite names "b:1", so the names of another table are quoted. Measured on 3.54:
+            // REFERENCES v1(b:1) is a syntax error, which killed a thread of the 2026-10-03 trunk run.
             final TableKind type = tempTable ? TableKind.TEMP : TableKind.MAIN;
             List<SQLite3Table> applicableTables = existingSchema.getTables().getTables().stream()
-                    .filter(t -> t.getTableType() == type).collect(Collectors.toList());
+                    .filter(t -> t.getTableType() == type && !t.isView()).collect(Collectors.toList());
             if (applicableTables.isEmpty()) {
                 referencedTableName = tableName;
                 for (int i = 0; i < foreignKeyColumns.size(); i++) {
@@ -193,9 +197,9 @@ public class SQLite3TableGenerator {
                 }
             } else {
                 SQLite3Table randomTable = Randomly.fromList(applicableTables);
-                referencedTableName = randomTable.getName();
+                referencedTableName = quoteIdentifier(randomTable.getName());
                 for (int i = 0; i < foreignKeyColumns.size(); i++) {
-                    columns.add(randomTable.getRandomColumn().getName());
+                    columns.add(quoteIdentifier(randomTable.getRandomColumn().getName()));
                 }
             }
         }
@@ -213,6 +217,10 @@ public class SQLite3TableGenerator {
                     "DEFERRABLE INITIALLY IMMEDIATE", "DEFERRABLE");
             sb.append(deferrable);
         }
+    }
+
+    private static String quoteIdentifier(String name) {
+        return "\"" + name.replace("\"", "\"\"") + "\"";
     }
 
     private void addActionClause(String string) {
