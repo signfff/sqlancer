@@ -80,6 +80,9 @@ async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoRespons
     };
     let variants = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match Parser::parse_sql(&dialect, &query_str) {
+            Ok(statements) if statements.len() == 1 && !prints_faithfully(&statements[0]) => {
+                Err("the query does not survive printing: sqlparser would change a literal".to_string())
+            }
             Ok(statements) if statements.len() == 1 => match &statements[0] {
                 Statement::Query(query) => {
                     generate_query_variants(query, req.max_variants, &query_str)
@@ -111,9 +114,22 @@ async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoRespons
         .into_response()
 }
 
+/// Whether printing the statement and parsing it again gives the same statement. Every variant goes
+/// out through sqlparser's printer, and that printer leaves a quote unescaped when the string holds
+/// two quotes in a row or a backslash before one: the value `Q''\` is printed as 'Q''\', which reads
+/// back as `Q'\` (measured on sqlparser 0.62). The variant then asks about a different string, and
+/// the 2026-10-03 v2 trunk run reported that sixteen times as a single-side empty mismatch. Refusing
+/// such a query costs a handful of checks; anything else the printer cannot reproduce is caught too.
+fn prints_faithfully(statement: &Statement) -> bool {
+    match Parser::parse_sql(&GenericDialect {}, &statement.to_string()) {
+        Ok(reparsed) => reparsed.len() == 1 && reparsed[0] == *statement,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{generate_query_variants, preprocess_sqlite_sql};
+    use super::{generate_query_variants, preprocess_sqlite_sql, prints_faithfully};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -142,6 +158,33 @@ mod tests {
         assert!(!variants.is_empty());
         assert!(variants.iter().all(|v| !v.contains("X'7979'")));
         assert!(variants.iter().any(|v| v.contains("0x7979")));
+    }
+
+    fn parse_one(sql: &str) -> Statement {
+        Parser::parse_sql(&GenericDialect {}, &preprocess_sqlite_sql(sql)).unwrap().remove(0)
+    }
+
+    #[test]
+    fn a_literal_the_printer_would_change_is_refused() {
+        // From the v2 trunk run: the value Q''\ came back as 'Q''\', which is Q'\.
+        assert!(!prints_faithfully(&parse_one(r"SELECT * FROM t0 WHERE (((t0.c0)=('Q''''\')))")));
+        assert!(!prints_faithfully(&parse_one(r"SELECT * FROM t0 WHERE c0 = 'a''''b'")));
+        assert!(!prints_faithfully(&parse_one(r"SELECT * FROM t0 WHERE c0 = 'a\''b'")));
+    }
+
+    #[test]
+    fn ordinary_queries_survive_printing() {
+        for sql in [
+            "SELECT * FROM t0 WHERE c0 = 'a''b'",
+            r"SELECT * FROM t0 WHERE c0 = 'a\b'",
+            r"SELECT * FROM t0 WHERE c0 = 'x''\'",
+            "SELECT c0 FROM t0 WHERE c0 <= x'7979' ORDER BY c0 DESC LIMIT 10",
+            "SELECT * FROM t0 WHERE (t0.c0 COLLATE NOCASE) = 'abc' AND t0.c1 IN (SELECT c1 FROM t1)",
+            "SELECT * FROM t0 FULL OUTER JOIN t1 ON t0.c0 = t1.c0 WHERE CAST(t0.c0 AS REAL) BETWEEN -1 AND 2",
+            "SELECT * FROM t0 WHERE '甙ⱞ' = t0.c0",
+        ] {
+            assert!(prints_faithfully(&parse_one(sql)), "{sql}");
+        }
     }
 }
 
