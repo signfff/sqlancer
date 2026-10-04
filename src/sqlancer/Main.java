@@ -382,17 +382,17 @@ public final class Main {
             return databaseProvider.getLoggableFactory().convertStacktraceToLoggable(e1);
         }
 
+        // Written statement by statement: a database that ran for hours holds hundreds of MB of
+        // statements, and building them into one string first ran a 3 GB heap out of memory and lost
+        // the report (2026-10-03 trunk run, database0 and database3).
         private void printState(FileWriter writer, StateToReproduce state) {
-            StringBuilder sb = new StringBuilder();
-
-            sb.append(databaseProvider.getLoggableFactory()
-                    .getInfo(state.getDatabaseName(), state.getDatabaseVersion(), state.getSeedValue()).getLogString());
-
-            for (Query<?> s : state.getStatements()) {
-                sb.append(databaseProvider.getLoggableFactory().createLoggable(s.getLogString()).getLogString());
-            }
             try {
-                writer.write(sb.toString());
+                writer.write(databaseProvider.getLoggableFactory()
+                        .getInfo(state.getDatabaseName(), state.getDatabaseVersion(), state.getSeedValue())
+                        .getLogString());
+                for (Query<?> s : state.getStatements()) {
+                    writer.write(databaseProvider.getLoggableFactory().createLoggable(s.getLogString()).getLogString());
+                }
             } catch (IOException e) {
                 throw new AssertionError(e);
             }
