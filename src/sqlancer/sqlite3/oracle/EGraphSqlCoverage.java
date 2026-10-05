@@ -292,9 +292,11 @@ public class EGraphSqlCoverage {
      * property is set, so the cases can be replayed and triaged by hand.
      */
     public static void recordVariantOnlyError(String message, String originalSql, String variantSql) {
-        String key = message == null ? "unknown" : message.replaceAll("[0-9]+", "N").trim();
-        if (key.length() > 90) {
-            key = key.substring(0, 90);
+        // 200, not 90: a swallowed error's key carries two prefixes before its reason, and at 90 the
+        // reason ("malformed JSON", "no such column") was cut off.
+        String key = message == null ? "unknown" : message.replaceAll("[0-9]+", "N").replaceAll("\\s+", " ").trim();
+        if (key.length() > 200) {
+            key = key.substring(0, 200);
         }
         variantOnlyErrorTotal.incrementAndGet();
         variantOnlyErrors.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();

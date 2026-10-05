@@ -17,6 +17,7 @@ public class SQLQueryAdapter extends Query<SQLConnection> implements Serializabl
     private final String query;
     private final ExpectedErrors expectedErrors;
     private final boolean couldAffectSchema;
+    private transient String swallowedError;
 
     public SQLQueryAdapter(String query) {
         this(query, new ExpectedErrors());
@@ -157,11 +158,21 @@ public class SQLQueryAdapter extends Query<SQLConnection> implements Serializabl
         }
     }
 
+    /**
+     * The message of the last error this query swallowed as expected, or "statement timeout", or null. The expected
+     * errors include "[SQLITE_ERROR] SQL error or missing database", which every SQLite error message starts with, so
+     * a swallowed error is otherwise indistinguishable from a syntax error.
+     */
+    public String getSwallowedError() {
+        return swallowedError;
+    }
+
     public void checkException(Exception e) throws AssertionError {
         Throwable ex = e;
 
         while (ex != null) {
             if (expectedErrors.errorIsExpected(ex.getMessage())) {
+                swallowedError = ex.getMessage();
                 return;
             } else {
                 ex = ex.getCause();
@@ -210,6 +221,7 @@ public class SQLQueryAdapter extends Query<SQLConnection> implements Serializabl
             s.close();
             Main.nrUnsuccessfulActions.addAndGet(1);
             if (isStatementTimeout(e)) {
+                swallowedError = "statement timeout";
                 return null;
             }
             if (reportException) {

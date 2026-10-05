@@ -479,8 +479,10 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             result = q.executeAndGet(state);
             if (result == null) {
                 if (originalQueryForTriage != null) {
+                    String swallowed = q.getSwallowedError();
                     sqlancer.sqlite3.oracle.EGraphSqlCoverage.recordVariantOnlyError(
-                            "(expected error swallowed by SQLQueryAdapter)", originalQueryForTriage, queryString);
+                            "(expected error swallowed by SQLQueryAdapter) " + (swallowed == null ? "?" : swallowed),
+                            originalQueryForTriage, queryString);
                 }
                 throw new IgnoreMeException();
             }
