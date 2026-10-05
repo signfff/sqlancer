@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Long EGRAPH capture on Linux: the counterpart of start-long-codecov-capture.ps1.
 #
-# Same corpus inputs and the same -D properties, with four differences:
+# Same corpus inputs and the same -D properties, with five differences:
 #   * SQLite's trunk is the system under test by default (build-trunk-jdbc.sh), and its shell is the
 #     referee. --sut bundled tests the driver's own library instead.
-#   * The heap ceiling is 32g, not 3g: a database is only replaced when it reports a mismatch, and
-#     SQLancer keeps every statement it ran to reproduce one. On the 2026-10-03 trunk run a
-#     database held 2.5 GB of them after 4 hours and filled a 3g heap.
+#   * A database is replaced after 100000 checks, SQLancer's own default, not after 100000000.
+#     SQLancer keeps every statement a database ran to reproduce a finding, and an EGRAPH check
+#     costs about 36 KB of them (base query, up to 16 variants, a corpus case's setup): one database
+#     run for 24 hours on 2026-10-04 filled a 32g heap and halved the check rate. 100000 checks is
+#     about 3.6 GB and three hours.
+#   * The heap ceiling is 32g, not 3g, for that 3.6 GB with room to spare.
 #   * The run directory is the working directory, so logs/, databases/ and the superjournals land in
 #     it and several runs can go side by side on one machine.
 #   * The rewrite server is started if nothing answers on :3000, and --detach leaves the run going
@@ -122,7 +125,7 @@ java_args+=(
     --num-threads=1
     --num-tries=100000
     --max-generated-databases=-1
-    --num-queries=100000000
+    --num-queries=100000
     --num-statement-kind-retries=3
     "--timeout-seconds=$timeout"
     --print-progress-information=true
