@@ -7,13 +7,16 @@
 #     -Dorg.sqlite.lib.path=$OUT_DIR/build -Dorg.sqlite.lib.name=libsqlitejdbc.so
 #
 # Usage: build-trunk-jdbc.sh [--no-fetch]
-#   OUT_DIR   (default: coverage/sqlite/trunk-jdbc next to this script)
-#   JDBC_TAG  (default: 3.53.4.0, the sqlite-jdbc version in pom.xml)
+#   OUT_DIR    (default: coverage/sqlite/trunk-jdbc next to this script)
+#   JDBC_TAG   (default: 3.53.4.0, the sqlite-jdbc version in pom.xml)
+#   SQLITE_REF (default: master) a branch or tag of SQLite to build instead, e.g. version-3.53.4 for a
+#              release that still has the defects a positive control needs; use its own OUT_DIR
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 OUT_DIR=${OUT_DIR:-$here/trunk-jdbc}
 JDBC_TAG=${JDBC_TAG:-3.53.4.0}
+SQLITE_REF=${SQLITE_REF:-master}
 JDBC_JAR=${JDBC_JAR:-$HOME/.m2/repository/org/xerial/sqlite-jdbc/$JDBC_TAG/sqlite-jdbc-$JDBC_TAG.jar}
 no_fetch=0
 [ "${1:-}" = "--no-fetch" ] && no_fetch=1
@@ -24,15 +27,16 @@ build=$OUT_DIR/build
 repo=$OUT_DIR/repo
 mkdir -p "$build"
 
-# 1. Latest trunk, shallow. GitHub drops a connection now and then: retry before giving up.
-if [ ! -d "$repo/.git" ]; then
+# 1. Latest trunk (or SQLITE_REF), shallow. GitHub drops a connection now and then: retry before giving up.
+if [ ! -d "$repo/.git" ] && [ "$SQLITE_REF" = master ]; then
     git clone -q --depth 1 https://github.com/sqlite/sqlite.git "$repo"
 elif [ $no_fetch = 1 ]; then
     echo "Skipping the fetch: building $(git -C "$repo" log -1 --format='%h %ci')"
 else
+    [ -d "$repo/.git" ] || { git init -q "$repo" && git -C "$repo" remote add origin https://github.com/sqlite/sqlite.git; }
     ok=0
     for attempt in 1 2 3 4; do
-        if git -C "$repo" fetch -q --depth 1 origin master; then ok=1; break; fi
+        if git -C "$repo" fetch -q --depth 1 origin "$SQLITE_REF"; then ok=1; break; fi
         sleep 5
     done
     [ $ok = 1 ] || { echo "fetching trunk from GitHub failed" >&2; exit 1; }
@@ -59,12 +63,32 @@ for f in src/main/java/org/sqlite/core/NativeDB.c src/main/java/org/sqlite/core/
 done
 
 # 3. The same edits sqlite-jdbc's Makefile makes (its own perl one-liners).
-perl -p -e 's/^opendb_out:/  if(!db->mallocFailed && rc==SQLITE_OK){ rc = RegisterExtensionFunctions(db); }\nopendb_out:/;' \
+perl -p -e 's/^opendb_out:/  if(!db->mallocFailed && rc==SQLITE_OK){ rc = RegisterExtensionFunctions(db); }\n  if(!db->mallocFailed && rc==SQLITE_OK){ rc = SqlancerRegisterOptimizations(db); }\nopendb_out:/;' \
      "$OUT_DIR/sqlite3.c" \
   | perl -p -e 's/^(static const char \* const sqlite3azCompileOpt.+)$/\1\n\n\/* This has been automatically added by sqlite-jdbc *\/\n  "JDBC_EXTENSIONS",/;' \
   > "$build/sqlite3.c"
 cat "$OUT_DIR/extension-functions.c" >> "$build/sqlite3.c"
+# Not part of sqlite-jdbc: sqlancer_optimizations(mask) sets the optimizer flags of the calling
+# connection (sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS), a set bit turns one optimization
+# off, 0 restores the default) and returns the mask. JDBC cannot reach sqlite3_test_control, and the
+# EGRAPH oracle runs variants under a mask so that the two sides of a check take different
+# optimizer paths. The referee shell is built from this file and has the same function.
+cat >> "$build/sqlite3.c" <<'EOF'
+
+/* Added by SQLancer's build-trunk-jdbc.sh */
+static void sqlancerOptimizationsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  unsigned int mask = (unsigned int)sqlite3_value_int64(argv[0]);
+  (void)argc;
+  sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS, sqlite3_context_db_handle(ctx), mask);
+  sqlite3_result_int64(ctx, (sqlite3_int64)mask);
+}
+int SqlancerRegisterOptimizations(sqlite3 *db){
+  return sqlite3_create_function(db, "sqlancer_optimizations", 1, SQLITE_UTF8|SQLITE_DIRECTONLY, 0,
+                                 sqlancerOptimizationsFunc, 0, 0);
+}
+EOF
 grep -q 'rc = RegisterExtensionFunctions(db);' "$build/sqlite3.c"
+grep -q 'rc = SqlancerRegisterOptimizations(db);' "$build/sqlite3.c"
 grep -q '"JDBC_EXTENSIONS",' "$build/sqlite3.c"
 perl -p -e 's/sqlite3_api;/sqlite3_api = 0;/g' "$OUT_DIR/sqlite3ext.h" > "$build/sqlite3ext.h"
 cp "$OUT_DIR/sqlite3.h" "$build/"

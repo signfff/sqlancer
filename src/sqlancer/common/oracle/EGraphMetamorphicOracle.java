@@ -96,6 +96,10 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
 
     private Reproducer<G> reproducer;
     private String lastQueryString;
+    /** Optimizer flags for the variants of a check; see EGraphOptimizerMask. One per oracle, i.e. per connection. */
+    private final sqlancer.sqlite3.oracle.EGraphOptimizerMask optMask = new sqlancer.sqlite3.oracle.EGraphOptimizerMask();
+    /** The mask the current check's variants run under, 0 for none; written into its reproducers. */
+    private int currentMask;
 
     public EGraphMetamorphicOracle(G state, QueryGenerator<G> queryGenerator, ExpectedErrors errors,
             EGraphVariantGenerator variantGenerator) {
@@ -150,6 +154,23 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             }
             lastQueryString = originalQuery;
 
+            // The original always runs under the default optimizations; the mask, if any, is set for
+            // the variants only. In DQP mode the original is compared with itself under the mask, and
+            // a check that gets no mask has nothing to compare.
+            boolean dqp = sqlancer.sqlite3.oracle.EGraphOptimizerMask
+                    .mode() == sqlancer.sqlite3.oracle.EGraphOptimizerMask.Mode.DQP;
+            optMask.reset(state);
+            currentMask = optMask.choose(state, originalQuery);
+            if (dqp && currentMask == 0) {
+                skipped = true;
+                throw new IgnoreMeException();
+            }
+            if (currentMask != 0) {
+                sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " optmask "
+                        + sqlancer.sqlite3.oracle.EGraphOptimizerMask.describe(currentMask)
+                        + (dqp ? " dqp" : " combined"));
+            }
+
             sqlancer.sqlite3.oracle.EGraphSqlCoverage.beginPlanGroup();
             long origExecStart = System.currentTimeMillis();
             sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " original-exec start source="
@@ -174,35 +195,39 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
 
             long variantStart = System.currentTimeMillis();
             List<String> variants;
-            try {
-                sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " egraph-request start source="
-                        + querySource + " rewrite=" + formatQuery(rewriteQuery));
-                variants = variantGenerator.generateVariants(rewriteQuery);
-                VARIANTS_UNAVAILABLE_IN_A_ROW.set(0);
-            } catch (Exception e) {
-                if (isVariantGenerationUnavailable(e)) {
-                    // Without the rewrite server a check has nothing to compare against, and this
-                    // path used to skip quietly. A 24 hour capture lost 21 of its hours that way:
-                    // the server was killed, every check after it was skipped, and the run kept
-                    // reporting progress. Past a run of failures there is nothing to wait for.
-                    long inARow = VARIANTS_UNAVAILABLE_IN_A_ROW.incrementAndGet();
-                    if (inARow == 1 || inARow % VARIANTS_UNAVAILABLE_WARN_EVERY == 0) {
-                        System.err.printf(
-                                "[EGRAPH] the rewrite server has refused %d checks in a row (%s). "
-                                        + "Nothing is being tested while it is down.%n",
-                                inARow, e);
+            if (dqp) {
+                variants = java.util.Collections.singletonList(originalQuery);
+            } else {
+                try {
+                    sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " egraph-request start source="
+                            + querySource + " rewrite=" + formatQuery(rewriteQuery));
+                    variants = variantGenerator.generateVariants(rewriteQuery);
+                    VARIANTS_UNAVAILABLE_IN_A_ROW.set(0);
+                } catch (Exception e) {
+                    if (isVariantGenerationUnavailable(e)) {
+                        // Without the rewrite server a check has nothing to compare against, and this
+                        // path used to skip quietly. A 24 hour capture lost 21 of its hours that way:
+                        // the server was killed, every check after it was skipped, and the run kept
+                        // reporting progress. Past a run of failures there is nothing to wait for.
+                        long inARow = VARIANTS_UNAVAILABLE_IN_A_ROW.incrementAndGet();
+                        if (inARow == 1 || inARow % VARIANTS_UNAVAILABLE_WARN_EVERY == 0) {
+                            System.err.printf(
+                                    "[EGRAPH] the rewrite server has refused %d checks in a row (%s). "
+                                            + "Nothing is being tested while it is down.%n",
+                                    inARow, e);
+                        }
+                        if (VARIANTS_UNAVAILABLE_LIMIT > 0 && inARow >= VARIANTS_UNAVAILABLE_LIMIT) {
+                            System.err.printf(
+                                    "[EGRAPH] giving up after %d checks without the rewrite server. "
+                                            + "Raise -Degraph.variantServerFailAfter to wait longer, or 0 to wait forever.%n",
+                                    inARow);
+                            System.exit(3);
+                        }
+                        skipped = true;
+                        throw new IgnoreMeException();
                     }
-                    if (VARIANTS_UNAVAILABLE_LIMIT > 0 && inARow >= VARIANTS_UNAVAILABLE_LIMIT) {
-                        System.err.printf(
-                                "[EGRAPH] giving up after %d checks without the rewrite server. "
-                                        + "Raise -Degraph.variantServerFailAfter to wait longer, or 0 to wait forever.%n",
-                                inARow);
-                        System.exit(3);
-                    }
-                    skipped = true;
-                    throw new IgnoreMeException();
+                    throw new AssertionError("EGRAPH variant generation failed: " + e, e);
                 }
-                throw new AssertionError("EGRAPH variant generation failed: " + e, e);
             }
             long variantTime = System.currentTimeMillis() - variantStart;
             sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " egraph-request done source="
@@ -233,9 +258,10 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             boolean corpusCaseRecorded = false;
             List<String> replayQueries = new ArrayList<>();
             replayQueries.add(originalQuery);
+            optMask.apply(state, currentMask);
             for (int i = 0; i < variants.size(); i++) {
-                String variantQuery = generatedQuery.wrapVariant(variants.get(i));
-                if (variantQuery == null || variantQuery.isBlank() || variantQuery.equals(originalQuery)) {
+                String variantQuery = dqp ? originalQuery : generatedQuery.wrapVariant(variants.get(i));
+                if (variantQuery == null || variantQuery.isBlank() || (!dqp && variantQuery.equals(originalQuery))) {
                     continue;
                 }
 
@@ -258,7 +284,7 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                 try {
                     if (hasSingleSideEmptyMismatch(originalResult, variantResult)) {
                         logSingleSideEmptyMismatch(state, querySource, rewriteQuery, originalQuery, variantQuery,
-                                originalResult, variantResult);
+                                originalResult, variantResult, currentMask);
                         throw new AssertionError(String.format(
                                 "EGRAPH single-side empty result mismatch! Original rows: %d, variant rows: %d.%nFirst query: \"%s\"%nSecond query: \"%s\"",
                                 originalResult.size(), variantResult.size(), originalQuery, variantQuery));
@@ -291,14 +317,18 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                                 i + 1, variantResult.size(), varExecTime);
                     }
                 } catch (AssertionError e) {
+                    if (currentMask != 0) {
+                        attributeMaskedFinding(generatedQuery.truncation(), originalQuery, variantQuery,
+                                originalResult, variantResult);
+                    }
                     // Ask the trunk build first when one is configured. It answers from behaviour -
                     // do these two queries agree on an engine carrying every fix since the release -
                     // where the signatures below only recognise the shape of a report someone
-                    // already wrote down.
+                    // already wrote down. A masked variant is replayed under the same mask.
                     sqlancer.sqlite3.oracle.EGraphTrunkReferee.Verdict verdict = sqlancer.sqlite3.oracle.EGraphTrunkReferee
                             .isConfigured()
                                     ? sqlancer.sqlite3.oracle.EGraphTrunkReferee.judge(currentDatabaseFile(state),
-                                            originalQuery, variantQuery)
+                                            originalQuery, variantQuery, currentMask)
                                     : null;
                     if (verdict == sqlancer.sqlite3.oracle.EGraphTrunkReferee.Verdict.FIXED_UPSTREAM
                             || verdict == sqlancer.sqlite3.oracle.EGraphTrunkReferee.Verdict.UNSTABLE_QUERY) {
@@ -372,11 +402,78 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             skipped = true;
             throw e;
         } finally {
+            // Whatever ended the check, the next statement - context setup of the next check included -
+            // must run under the default optimizations again.
+            if (currentMask != 0) {
+                optMask.reset(state);
+                currentMask = 0;
+            }
             sqlancer.sqlite3.oracle.EGraphSqlCoverage.endPlanGroup();
             if (show && !skipped) {
                 System.err.println("[MONITOR] Complete check shown.");
             }
         }
+    }
+
+    /**
+     * Says which side a finding under an optimizer mask needs, by re-running it with each factor alone on the same
+     * database: the original under the mask (no rewriting) and the variant under the default optimizations (no mask).
+     * Leaves the mask applied, as the variant loop expects.
+     */
+    private void attributeMaskedFinding(sqlancer.sqlite3.SQLite3OracleFactory.TruncationKind truncation,
+            String originalQuery, String variantQuery, List<String> originalResult, List<String> variantResult) {
+        int mask = currentMask;
+        List<String> originalMasked = null;
+        List<String> variantDefault = null;
+        try {
+            originalMasked = getResultRows(originalQuery, errors, state);
+        } catch (Exception | AssertionError ignored) {
+            // Left unknown.
+        }
+        try {
+            optMask.apply(state, 0);
+            variantDefault = getResultRows(variantQuery, errors, state);
+        } catch (Exception | AssertionError ignored) {
+            // Left unknown.
+        } finally {
+            try {
+                optMask.apply(state, mask);
+            } catch (java.sql.SQLException e) {
+                throw new AssertionError("could not restore the optimizer mask", e);
+            }
+        }
+        sqlancer.sqlite3.oracle.EGraphOptimizerMask.Attribution attribution;
+        if (originalMasked != null && !sameOutcome(truncation, originalResult, originalMasked)) {
+            attribution = sqlancer.sqlite3.oracle.EGraphOptimizerMask.Attribution.OPTIMIZER;
+        } else if (variantDefault != null && !sameOutcome(truncation, originalResult, variantDefault)) {
+            attribution = sqlancer.sqlite3.oracle.EGraphOptimizerMask.Attribution.EGRAPH;
+        } else if (originalMasked != null && variantDefault != null) {
+            attribution = sqlancer.sqlite3.oracle.EGraphOptimizerMask.Attribution.COMBINED;
+        } else {
+            attribution = sqlancer.sqlite3.oracle.EGraphOptimizerMask.Attribution.UNKNOWN;
+        }
+        sqlancer.sqlite3.oracle.EGraphOptimizerMask.recordFinding(attribution, mask, originalQuery, variantQuery,
+                originalResult.size(), originalMasked == null ? -1 : originalMasked.size(),
+                variantDefault == null ? -1 : variantDefault.size(), variantResult.size());
+        state.getState().getLocalState()
+                .log(String.format("-- variant optimizer mask: SELECT sqlancer_optimizations(%s); -- %s; attribution %s",
+                        Integer.toUnsignedString(mask), sqlancer.sqlite3.oracle.EGraphOptimizerMask.describe(mask),
+                        attribution));
+    }
+
+    /** The comparison the variant loop makes, as a yes/no: whether two results of the same check agree. */
+    static boolean sameOutcome(sqlancer.sqlite3.SQLite3OracleFactory.TruncationKind truncation, List<String> a,
+            List<String> b) {
+        if (hasSingleSideEmptyMismatch(a, b)) {
+            return false;
+        }
+        if (truncation == sqlancer.sqlite3.SQLite3OracleFactory.TruncationKind.NESTED) {
+            return true;
+        }
+        if (truncation == sqlancer.sqlite3.SQLite3OracleFactory.TruncationKind.TRAILING) {
+            return a.size() == b.size();
+        }
+        return a.size() == b.size() && resultRowsMatch(a, b);
     }
 
     private void dumpDatabaseState() {
@@ -521,10 +618,16 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
     }
 
     private static void logSingleSideEmptyMismatch(SQLGlobalState<?, ?> state, String querySource, String rewriteQuery,
-            String originalQuery, String variantQuery, List<String> originalRows, List<String> variantRows) {
+            String originalQuery, String variantQuery, List<String> originalRows, List<String> variantRows,
+            int optimizerMask) {
         StringBuilder sb = new StringBuilder();
         sb.append("-- EGRAPH_SINGLE_SIDE_EMPTY_BEGIN\n");
         sb.append("-- source: ").append(querySource == null ? "UNKNOWN" : querySource).append('\n');
+        if (optimizerMask != 0) {
+            // The variant ran after SELECT sqlancer_optimizations(mask); the original under the default.
+            sb.append("-- variant_optimizer_mask: ")
+                    .append(sqlancer.sqlite3.oracle.EGraphOptimizerMask.describe(optimizerMask)).append('\n');
+        }
         sb.append("-- original_rows: ").append(originalRows.size()).append('\n');
         sb.append("-- variant_rows: ").append(variantRows.size()).append('\n');
         sb.append("-- base_query_sent_to_egraph:\n");

@@ -882,6 +882,12 @@ public class EGraphSqlCoverage {
                 w.println();
             }
 
+            if (EGraphOptimizerMask.mode() != EGraphOptimizerMask.Mode.OFF) {
+                w.println("  Optimizer masks (-Degraph.optMask)");
+                w.println("    " + EGraphOptimizerMask.summary());
+                w.println();
+            }
+
             if (!corpusFilterSnapshot.isEmpty()) {
                 w.println("  Corpus input filter skips");
                 for (Map.Entry<String, AtomicInteger> entry : corpusFilterSnapshot.entrySet()) {

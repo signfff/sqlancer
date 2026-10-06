@@ -69,6 +69,15 @@ public final class EGraphTrunkReferee {
      *                     disturbed and the referee cannot write to it
      */
     public static Verdict judge(File databaseFile, String originalQuery, String variantQuery) {
+        return judge(databaseFile, originalQuery, variantQuery, 0);
+    }
+
+    /**
+     * @param variantMask optimizer flags the variant ran under (see EGraphOptimizerMask), replayed with
+     *                    sqlancer_optimizations() before it; 0 for the default. Without it a defect the mask exposed
+     *                    would not reproduce here, be judged FIXED_UPSTREAM and end up suppressed as a known bug.
+     */
+    public static Verdict judge(File databaseFile, String originalQuery, String variantQuery, int variantMask) {
         if (!isConfigured()) {
             return Verdict.UNKNOWN;
         }
@@ -80,8 +89,8 @@ public final class EGraphTrunkReferee {
         try {
             copy = Files.createTempFile("egraph-referee", ".db");
             Files.copy(databaseFile.toPath(), copy, StandardCopyOption.REPLACE_EXISTING);
-            String original = run(copy, originalQuery);
-            String variant = run(copy, variantQuery);
+            String original = run(copy, originalQuery, 0);
+            String variant = run(copy, variantQuery, variantMask);
             if (original == null || variant == null) {
                 FAILED.incrementAndGet();
                 unanswered(original == null ? "original-did-not-run" : "variant-did-not-run",
@@ -191,7 +200,7 @@ public final class EGraphTrunkReferee {
     private static final String MARKER = "EGRAPH_REFEREE_OUTPUT_BEGINS";
 
     /** The query's output under the trunk build, or null when the build could not run it. */
-    private static String run(Path database, String query) throws IOException, InterruptedException {
+    private static String run(Path database, String query, int mask) throws IOException, InterruptedException {
         List<String> command = new ArrayList<>(List.of(COMMAND.split("\\s+")));
         command.add(translatePath(database));
         Path script = Files.createTempFile("egraph-referee", ".sql");
@@ -205,6 +214,11 @@ public final class EGraphTrunkReferee {
             for (String statement : EGraphContextSnapshot.current()) {
                 sql.append(stripTrailingSemicolon(statement)).append(';').append(System.lineSeparator());
                 statementCount++;
+            }
+            if (mask != 0) {
+                // Before the marker, so the function's own output is not taken for the query's.
+                sql.append("SELECT sqlancer_optimizations(").append(Integer.toUnsignedString(mask)).append(");")
+                        .append(System.lineSeparator());
             }
             sql.append("SELECT '").append(MARKER).append("';").append(System.lineSeparator());
             sql.append(stripTrailingSemicolon(query)).append(';').append(System.lineSeparator());
