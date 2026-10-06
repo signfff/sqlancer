@@ -195,6 +195,10 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
 
             long variantStart = System.currentTimeMillis();
             List<String> variants;
+            // Whether the original is compared with itself under the mask: always in DQP mode, and in
+            // combined mode when the rewrite server has nothing for this query - a masked check still has
+            // an optimizer path to test then (f9d7a71210 in the benchmark is caught no other way).
+            boolean selfCompare = dqp;
             if (dqp) {
                 variants = java.util.Collections.singletonList(originalQuery);
             } else {
@@ -223,11 +227,23 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                                     inARow);
                             System.exit(3);
                         }
-                        skipped = true;
-                        throw new IgnoreMeException();
+                        if (currentMask == 0) {
+                            skipped = true;
+                            throw new IgnoreMeException();
+                        }
+                        variants = java.util.Collections.singletonList(originalQuery);
+                        selfCompare = true;
+                    } else {
+                        throw new AssertionError("EGRAPH variant generation failed: " + e, e);
                     }
-                    throw new AssertionError("EGRAPH variant generation failed: " + e, e);
                 }
+            }
+            if ((variants == null || variants.isEmpty()) && currentMask != 0) {
+                variants = java.util.Collections.singletonList(originalQuery);
+                selfCompare = true;
+            }
+            if (selfCompare && !dqp) {
+                sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " optmask self-compare fallback");
             }
             long variantTime = System.currentTimeMillis() - variantStart;
             sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " egraph-request done source="
@@ -260,8 +276,9 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             replayQueries.add(originalQuery);
             optMask.apply(state, currentMask);
             for (int i = 0; i < variants.size(); i++) {
-                String variantQuery = dqp ? originalQuery : generatedQuery.wrapVariant(variants.get(i));
-                if (variantQuery == null || variantQuery.isBlank() || (!dqp && variantQuery.equals(originalQuery))) {
+                String variantQuery = selfCompare ? originalQuery : generatedQuery.wrapVariant(variants.get(i));
+                if (variantQuery == null || variantQuery.isBlank()
+                        || (!selfCompare && variantQuery.equals(originalQuery))) {
                     continue;
                 }
 
