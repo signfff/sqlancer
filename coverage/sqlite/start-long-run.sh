@@ -122,6 +122,7 @@ java_args+=(
     "-Degraph.referee.log=$run_dir/referee.sql"
     "-Degraph.knownBugs.log=$run_dir/known-bugs.sql"
     "-Degraph.optMask.log=$run_dir/optmask-findings.log"
+    "-Degraph.repro.dir=$run_dir/repro"
     "-Dsqlite3.egraph.autoResearchResults=$auto_research_results"
     -cp "$jar"
     sqlancer.Main

@@ -33,6 +33,20 @@ public class TestEGraphOptimizerMask {
     }
 
     @Test
+    public void aBareColumnBesideMinOrMaxIsNotMasked() {
+        // The 2026-10-06 trunk run: tied on max(c2), the index plan and the full scan took different bare c1 values.
+        assertTrue(EGraphOptimizerMask.isOrderSensitive("SELECT * FROM (SELECT ALL t0.c2, t0.c1, t0.c0 FROM t0 WHERE"
+                + " (((t0.c1, t0.c2) IN (SELECT egraph_sub.\"c1\", max(egraph_sub.\"c2\") FROM \"t0\" AS egraph_sub))))"
+                + " AS egraph_limit LIMIT -1 OFFSET 0"));
+        assertTrue(EGraphOptimizerMask.isOrderSensitive("SELECT c1, MIN(c2) FROM t0"));
+        assertTrue(EGraphOptimizerMask.isOrderSensitive("SELECT c0, count(*) FROM t0 GROUP BY c1"));
+
+        assertFalse(EGraphOptimizerMask.isOrderSensitive("SELECT max(c2) FROM t0"));
+        assertFalse(EGraphOptimizerMask.isOrderSensitive("SELECT c0, c1 FROM t0 WHERE c2 = (SELECT max(c2) FROM t0)"));
+        assertFalse(EGraphOptimizerMask.isOrderSensitive("SELECT c0, 'max(' FROM t0"), "inside a string literal");
+    }
+
+    @Test
     public void randomMasksUseOnlyRealOptimizationBits() {
         int unused = (1 << 3) | (1 << 20);
         ThreadLocalRandom random = ThreadLocalRandom.current();

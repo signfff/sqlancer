@@ -169,13 +169,18 @@ public final class EGraphTrunkReferee {
      * which is coarse: a LIMIT ordered by a unique key does pin its rows down and is called unstable here anyway.
      * The trade is deliberate - such a mismatch cannot be told apart from a defect without running the plan.
      */
-    private static boolean limitsWithoutTotalOrder(String query) {
+    static boolean limitsWithoutTotalOrder(String query) {
         if (query == null) {
             return false;
         }
-        String upper = query.toUpperCase(Locale.ROOT);
+        // LIMIT -1 with no OFFSET or OFFSET 0 takes every row: the wrappers end on it, and reading it as a limit
+        // filed a reproducible mismatch as UNSTABLE_QUERY on 2026-10-06 and kept none of its data.
+        String upper = NO_LIMIT.matcher(query.toUpperCase(Locale.ROOT)).replaceAll(" ");
         return upper.contains(" LIMIT ") && !upper.contains("ORDER BY");
     }
+
+    private static final java.util.regex.Pattern NO_LIMIT = java.util.regex.Pattern
+            .compile("\\sLIMIT\\s+-1(?:\\s+OFFSET\\s+0)?(?!\\s*OFFSET)(?=\\s|;|\\)|$)");
 
     private static int countRows(String output) {
         return output.isEmpty() ? 0 : output.split("\n", -1).length;

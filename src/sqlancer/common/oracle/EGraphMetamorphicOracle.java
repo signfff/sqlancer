@@ -334,6 +334,9 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                                 i + 1, variantResult.size(), varExecTime);
                     }
                 } catch (AssertionError e) {
+                    // Before anything classifies it: a filed-away mismatch keeps no data otherwise.
+                    sqlancer.sqlite3.oracle.EGraphReproBundle.save(currentDatabaseFile(state), querySource,
+                            rewriteQuery, originalQuery, variantQuery, currentMask, originalResult, variantResult);
                     if (currentMask != 0) {
                         attributeMaskedFinding(generatedQuery.truncation(), originalQuery, variantQuery,
                                 originalResult, variantResult);

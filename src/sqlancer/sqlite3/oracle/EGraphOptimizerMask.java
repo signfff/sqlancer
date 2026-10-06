@@ -126,8 +126,92 @@ public final class EGraphOptimizerMask {
         return randomMask(random);
     }
 
+    private static final Pattern GROUP_BY = Pattern.compile("\\bgroup\\s+by\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern MIN_MAX = Pattern.compile("\\b(min|max)\\s*\\(", Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Whether the query's result depends on which row the plan visits first, which a mask is free to change.
+     *
+     * <p>
+     * Besides order-sensitive aggregates: a bare column beside min()/max() takes its value from one of the rows that
+     * tie for the extreme, any one of them (measured 2026-10-06 on trunk: two rows tied on max(c2)=x'', the index
+     * plan took the row with c1=x'db34', the full scan the one with c1=NULL, and {@code (c1, c2) IN (SELECT c1,
+     * max(c2) ...)} went from 1 row to 0); and under GROUP BY every bare column is some row of its group. A rewrite
+     * never re-planned such a subquery - the server refuses to touch it - but a mask re-plans the whole statement.
+     * </p>
+     */
     static boolean isOrderSensitive(String query) {
-        return query != null && ORDER_SENSITIVE.matcher(query).find();
+        if (query == null) {
+            return false;
+        }
+        return ORDER_SENSITIVE.matcher(query).find() || GROUP_BY.matcher(query).find() || hasBareColumnBesideMinMax(query);
+    }
+
+    private static final Pattern AGGREGATE = Pattern.compile(
+            "^\\s*(count|sum|total|avg|min|max|group_concat|string_agg|json_group_array|json_group_object)\\s*\\(",
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern STRING_LITERAL = Pattern.compile("'(?:[^']|'')*'");
+
+    /**
+     * Whether some SELECT list calls min()/max() next to a bare column - an item that is neither an aggregate nor a
+     * constant. Read from the text with string literals blanked; coarse on purpose (a scalar min(a, b) next to a column
+     * counts too), which only ever costs a mask.
+     */
+    static boolean hasBareColumnBesideMinMax(String query) {
+        String text = STRING_LITERAL.matcher(query.toLowerCase(Locale.ROOT)).replaceAll("''");
+        int from = 0;
+        while (true) {
+            int select = indexOfWord(text, "select", from);
+            if (select < 0) {
+                return false;
+            }
+            List<String> items = new ArrayList<>();
+            int depth = 0;
+            int itemStart = select + 6;
+            int end = text.length();
+            for (int i = select + 6; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '(') {
+                    depth++;
+                } else if (c == ')') {
+                    if (depth == 0) {
+                        end = i;
+                        break;
+                    }
+                    depth--;
+                } else if (depth == 0 && c == ',') {
+                    items.add(text.substring(itemStart, i));
+                    itemStart = i + 1;
+                } else if (depth == 0 && text.startsWith("from", i) && isWordAt(text, i, 4)) {
+                    end = i;
+                    break;
+                }
+            }
+            items.add(text.substring(itemStart, end));
+            boolean minMax = items.stream().anyMatch(item -> MIN_MAX.matcher(item).find());
+            boolean bare = items.stream().anyMatch(item -> !AGGREGATE.matcher(item.replaceFirst("^\\s*(all|distinct)\\b", ""))
+                    .find() && item.replaceAll("''", "").chars().anyMatch(Character::isLetter));
+            if (minMax && bare) {
+                return true;
+            }
+            from = select + 6;
+        }
+    }
+
+    private static int indexOfWord(String text, String word, int from) {
+        int at = text.indexOf(word, from);
+        while (at >= 0 && !isWordAt(text, at, word.length())) {
+            at = text.indexOf(word, at + 1);
+        }
+        return at;
+    }
+
+    private static boolean isWordAt(String text, int at, int length) {
+        boolean before = at == 0 || !Character.isLetterOrDigit(text.charAt(at - 1)) && text.charAt(at - 1) != '_';
+        int after = at + length;
+        boolean afterOk = after >= text.length() || !Character.isLetterOrDigit(text.charAt(after))
+                && text.charAt(after) != '_';
+        return before && afterOk;
     }
 
     /** One to three optimizations, or now and then all of them. */
