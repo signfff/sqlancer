@@ -19,6 +19,8 @@
 # Usage: start-long-run.sh [--timeout SEC] [--tag TAG] [--heap 32g] [--max-corpus-queries N]
 #                          [--sut trunk|bundled] [--referee CMD|""] [--no-auto-research-corpus]
 #                          [--detach] [-Dname=value ...]
+# Optimizer masks (EGraphOptimizerMask) are off unless asked for, e.g. -Degraph.optMask=combined; their
+# findings are attributed in <run>/optmask-findings.log.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -119,6 +121,7 @@ java_args+=(
     "-Degraph.referee.command=$referee"
     "-Degraph.referee.log=$run_dir/referee.sql"
     "-Degraph.knownBugs.log=$run_dir/known-bugs.sql"
+    "-Degraph.optMask.log=$run_dir/optmask-findings.log"
     "-Dsqlite3.egraph.autoResearchResults=$auto_research_results"
     -cp "$jar"
     sqlancer.Main
