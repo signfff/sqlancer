@@ -286,7 +286,15 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                 long varExecStart = System.currentTimeMillis();
                 sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " variant-exec start source="
                         + querySource + " variant#" + (i + 1) + " sql=" + formatQuery(variantQuery));
-                List<String> variantResult = getResultRows(variantQuery, errors, state, originalQuery);
+                List<String> variantResult;
+                try {
+                    variantResult = getResultRows(variantQuery, errors, state, originalQuery);
+                } catch (IgnoreMeException e) {
+                    // One variant's expected error (already logged as variant-only) says nothing
+                    // about the others; abandoning the check here skipped every variant after it.
+                    testedCount--;
+                    continue;
+                }
                 long varExecTime = System.currentTimeMillis() - varExecStart;
                 sqlancer.sqlite3.oracle.EGraphSqlCoverage.trace("check#" + checkNum + " variant-exec done source="
                         + querySource + " variant#" + (i + 1) + " rows=" + variantResult.size() + " ms="

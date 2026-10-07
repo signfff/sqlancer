@@ -2,8 +2,12 @@
 # Long EGRAPH capture on Linux: the counterpart of start-long-codecov-capture.ps1.
 #
 # Same corpus inputs and the same -D properties, with five differences:
-#   * SQLite's trunk is the system under test by default (build-trunk-jdbc.sh), and its shell is the
-#     referee. --sut bundled tests the driver's own library instead.
+#   * SQLite's trunk is the system under test by default (build-trunk-jdbc.sh). --sut bundled tests
+#     the driver's own library instead, with the trunk shell as referee and the known-bug signatures
+#     on. Against trunk both are off: the referee is built from the same source, so "agrees on trunk"
+#     can only mean its replay differed from the run, and the signatures name bugs trunk has fixed.
+#     Either verdict would only ever drop a finding (2026-10-07: a TEMP table missing from the
+#     replay, and every wrapper's EXISTS (... LIMIT 1) read as an unstable LIMIT).
 #   * A database is replaced after 100000 checks, SQLancer's own default, not after 100000000.
 #     SQLancer keeps every statement a database ran to reproduce a finding, and an EGRAPH check
 #     costs about 36 KB of them (base query, up to 16 variants, a corpus case's setup): one database
@@ -28,7 +32,7 @@ root=$(cd "$here/../.." && pwd)
 
 timeout=-1 tag="" heap=32g max_corpus_queries=30000 sut=trunk no_ar_corpus=0 detach=0
 trunk_build=$here/trunk-jdbc/build
-referee=$trunk_build/sqlite3_trunk
+referee=$trunk_build/sqlite3_trunk referee_given=0
 extra=()
 while [ $# -gt 0 ]; do
     case $1 in
@@ -37,7 +41,7 @@ while [ $# -gt 0 ]; do
         --heap) heap=$2; shift 2 ;;
         --max-corpus-queries) max_corpus_queries=$2; shift 2 ;;
         --sut) sut=$2; shift 2 ;;
-        --referee) referee=$2; shift 2 ;;
+        --referee) referee=$2; referee_given=1; shift 2 ;;
         --no-auto-research-corpus) no_ar_corpus=1; shift ;;
         --detach) detach=1; shift ;;
         -D*) extra+=("$1"); shift ;;
@@ -54,7 +58,8 @@ if [ $detach = 1 ]; then
     # closed terminal does not take the run with it.
     mkdir -p "$run_dir"
     rerun=(--timeout "$timeout" --heap "$heap" --max-corpus-queries "$max_corpus_queries" --sut "$sut"
-           --referee "$referee" ${tag:+--tag "$tag"} "${extra[@]}")
+           ${tag:+--tag "$tag"} "${extra[@]}")
+    [ $referee_given = 1 ] && rerun+=(--referee "$referee")
     [ $no_ar_corpus = 1 ] && rerun+=(--no-auto-research-corpus)
     RUN_DIR="$run_dir" setsid nohup "$0" "${rerun[@]}" > "$run_dir/launcher.log" 2>&1 < /dev/null &
     echo "Detached (pid $!). Run dir: $run_dir"
@@ -73,10 +78,6 @@ egraph_input=$here/sqlite-official-select-only-variant-ready-corpus.sql
 case_count=$(grep -c -- '-- EGRAPH_CORPUS_CASE_BEGIN' "$egraph_input" || true)
 [ "$case_count" -gt 0 ] || { echo "Variant-ready EGRAPH input corpus has no cases: $egraph_input" >&2; exit 1; }
 
-# The freshest auto research, wherever finish-long-codecov.ps1 left it.
-auto_research_results=$(ls -t "$here"/*/auto-research-results.csv "$here"/*/auto-research/auto-research-results.csv \
-                        2>/dev/null | grep -v '/auto-research-smoke-' | head -1 || true)
-[ -n "$auto_research_results" ] || { echo "Missing auto-research results under $here" >&2; exit 1; }
 
 inputs=$egraph_input
 high_coverage=$here/high-coverage-egraph-corpus.sql
@@ -92,7 +93,9 @@ java_args=()
 case $sut in
     trunk)
         [ -f "$trunk_build/libsqlitejdbc.so" ] || { echo "Missing $trunk_build/libsqlitejdbc.so: run build-trunk-jdbc.sh" >&2; exit 1; }
-        java_args+=("-Dorg.sqlite.lib.path=$trunk_build" "-Dorg.sqlite.lib.name=libsqlitejdbc.so") ;;
+        java_args+=("-Dorg.sqlite.lib.path=$trunk_build" "-Dorg.sqlite.lib.name=libsqlitejdbc.so"
+                    -Degraph.knownBugs=false)
+        [ $referee_given = 1 ] || referee="" ;;
     bundled) ;;
     *) echo "--sut must be trunk or bundled" >&2; exit 2 ;;
 esac
@@ -101,29 +104,19 @@ java_args+=(
     --enable-native-access=ALL-UNNAMED
     -Dsqlancer.statementTimeoutSeconds=15
     "-Degraph.coverage.file=$run_dir/workload-hints.txt"
-    "-Degraph.replay.file=$run_dir/replay-all.sql"
-    "-Degraph.contextReplay.file=$run_dir/replay-context.sql"
-    "-Degraph.trace.file=$run_dir/egraph-trace.log"
     "-Degraph.singleSideEmptyLog=$run_dir/single-side-empty-reproducers.sql"
     "-Dsqlite3.egraph.input.maxQueries=$max_corpus_queries"
     -Dsqlite3.egraph.input.maxCaseSetupStatements=80
     -Dsqlite3.egraph.corpus.maxAttemptsPerCheck=4
-    -Dsqlite3.egraph.corpus.maxCases=200000
-    -Dsqlite3.egraph.corpus.maxEmptyCases=20000
-    -Dsqlite3.egraph.corpus.sampleInterval=3
-    -Dsqlite3.egraph.corpus.keyframeInterval=50
     "-Degraph.variantOnlyError.log=$run_dir/variant-only-errors.log"
-    -Dsqlite3.egraph.corpus.maxRowsPerTable=128
-    -Dsqlite3.egraph.contextReplay.maxStatements=4000
     -Dsqlite3.egraph.corpus.selectOnlyTemplates=true
     -Dsqlite3.egraph.baseSkeletons=true
-    -Dsqlite3.egraph.autoResearchGuidedShapes=true
     "-Degraph.referee.command=$referee"
     "-Degraph.referee.log=$run_dir/referee.sql"
     "-Degraph.knownBugs.log=$run_dir/known-bugs.sql"
     "-Degraph.optMask.log=$run_dir/optmask-findings.log"
     "-Degraph.repro.dir=$run_dir/repro"
-    "-Dsqlite3.egraph.autoResearchResults=$auto_research_results"
+    "-Degraph.integrity.log=$run_dir/integrity-findings.log"
     -cp "$jar"
     sqlancer.Main
     --num-threads=1
@@ -159,7 +152,6 @@ echo "System under test: $sut${referee:+, referee $referee}"
 echo "Official EGRAPH variant-ready cases: $case_count"
 echo "High-coverage corpus input: $hc_status"
 echo "Auto-research corpus input: $ar_status"
-echo "Auto-research results: $auto_research_results"
 if [ "$timeout" -gt 0 ]; then echo "SQLancer will stop after $timeout seconds ($((timeout / 3600)) h $((timeout % 3600 / 60)) min)."
 else echo "SQLancer will run without a time limit."; fi
 

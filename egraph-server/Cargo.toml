@@ -7,7 +7,7 @@ edition = "2021"
 axum = "0.6"
 egg = "0.9"
 serde = { version = "1.0", features = ["derive"] }
-sqlparser = "0.62"
+sqlparser = { version = "0.62", features = ["visitor"] }
 base64 = "0.13"
 tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"

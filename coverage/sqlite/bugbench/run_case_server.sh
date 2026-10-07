@@ -16,6 +16,7 @@ rm -rf "$work" && mkdir -p "$work" && work=$(readlink -f "$work")
     echo "-Degraph.knownBugs=false"
     echo "-Dsqlite3.egraph.corpus.allowJoin=true"
     echo "-Degraph.trace.file=$work/trace.log"
+    echo "-Degraph.explain=true"
     echo "-Degraph.singleSideEmptyLog=$work/sse.sql"
     echo "-Degraph.optMask.log=$work/optmask.log"
     for extra in "$@"; do echo "$extra"; done

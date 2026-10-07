@@ -439,8 +439,18 @@ public class EGraphSqlCoverage {
         corpusFilterSkips.computeIfAbsent(reason, ignored -> new AtomicInteger()).incrementAndGet();
     }
 
+    /**
+     * Whether every original and variant is preceded by an EXPLAIN QUERY PLAN, for the execution-feature and
+     * multi-plan statistics. Off by default: it is up to 17 extra statements per check and nothing in the comparison
+     * reads it. -Degraph.explain=true for A/B work that measures plans.
+     */
+    private static final boolean EXPLAIN = Boolean.getBoolean("egraph.explain");
+
     public static void recordExecution(String sql, SQLGlobalState<?, ?> state) {
         executedQueries.incrementAndGet();
+        if (!EXPLAIN) {
+            return;
+        }
         if (sql == null || sql.isBlank() || state == null) {
             explainFailures.incrementAndGet();
             return;
@@ -879,6 +889,13 @@ public class EGraphSqlCoverage {
             if (!refereeLines.isEmpty()) {
                 w.println("  Mismatches put to the trunk build (-Degraph.referee.command)");
                 refereeLines.forEach(w::println);
+                w.println();
+            }
+
+            List<String> integrityLines = EGraphIntegrityCheck.report();
+            if (!integrityLines.isEmpty()) {
+                w.println("  Integrity checks that did not answer ok (count, first line with numbers blanked)");
+                integrityLines.forEach(w::println);
                 w.println();
             }
 

@@ -53,6 +53,7 @@ import sqlancer.sqlite3.oracle.SQLite3PivotedQuerySynthesisOracle;
 import sqlancer.sqlite3.oracle.SQLite3EGraphInputCorpus.CorpusQueryInput;
 import sqlancer.sqlite3.oracle.EGraphContextReplayWriter;
 import sqlancer.sqlite3.oracle.EGraphContextSnapshot;
+import sqlancer.sqlite3.oracle.EGraphIntegrityCheck;
 import sqlancer.sqlite3.oracle.EGraphPredicateFilter;
 import sqlancer.sqlite3.oracle.SQLite3EGraphInputCorpus;
 import sqlancer.sqlite3.oracle.EGraphSqlCoverage;
@@ -345,9 +346,18 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
                 }
                 EGraphSqlCoverage.recordWrapperShape(baseQuery.shapeName);
                 EGraphCoverageContext originalContext = createEGraphCoverageContext(state, targetTables,
-                        chooseEGraphExecutionCoverageShape(EGraphCoverageShape.PLAIN));
+                        chooseEGraphCoverageShape());
                 EGraphCoverageContext variantContext = createVariantEGraphCoverageContext(originalContext,
                         targetTables);
+                // GROUP BY lists every table column, which a base query projecting only some of them
+                // does not have: the variant failed with "no such column", taken as an expected error,
+                // and the check was lost. The original side is probed below; the variant is not.
+                if (variantContext.shape == EGraphCoverageShape.GROUP_BY
+                        && ("BASE_" + EGraphBaseQueryShape.COLUMN_PROJECTION).equals(baseQuery.shapeName)
+                        || variantContext.shape == EGraphCoverageShape.GROUP_BY
+                                && ("BASE_" + EGraphBaseQueryShape.DISTINCT_COLUMNS).equals(baseQuery.shapeName)) {
+                    variantContext = originalContext;
+                }
                 String result = wrapEGraphCoverageShape(rewriteQuery, originalContext);
                 ProbeOutcome wrappedOutcome = probeQuery(state, result);
                 EGraphSqlCoverage.recordOriginalWrapper(originalContext.shape.name(), wrappedOutcome.name(), result);
@@ -1186,7 +1196,7 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
             .getInteger("egraph.emptyBaseCheckPercent", 10);
 
     private static final boolean AUTO_RESEARCH_GUIDED_SHAPES = Boolean
-            .parseBoolean(System.getProperty("sqlite3.egraph.autoResearchGuidedShapes", "true"));
+            .parseBoolean(System.getProperty("sqlite3.egraph.autoResearchGuidedShapes", "false"));
     private static final String AUTO_RESEARCH_RESULTS = System.getProperty("sqlite3.egraph.autoResearchResults",
             "D:\\sqlancer\\coverage\\sqlite\\auto-research-from-long-20260818-130511\\auto-research-results.csv");
     /**
@@ -2099,13 +2109,6 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
             return autoShape;
         }
         return Randomly.fromList(CORPUS_COVERAGE_SHAPE_POOL);
-    }
-
-    private static EGraphCoverageShape chooseEGraphExecutionCoverageShape(EGraphCoverageShape inputShape) {
-        if (inputShape != EGraphCoverageShape.PLAIN && Randomly.fromOptions(true, true, false)) {
-            return EGraphCoverageShape.PLAIN;
-        }
-        return chooseEGraphCoverageShape();
     }
 
     private static EGraphCoverageContext createEGraphCoverageContext(SQLite3GlobalState state,
@@ -5466,7 +5469,9 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
         }
         try {
             SQLQueryAdapter query = new SQLQueryAdapter(sql, couldAffectSchema || contextStatementCouldAffectSchema(sql));
-            boolean success = query.execute(state, false);
+            // An integrity check's answer is its result set, which execute() never reads.
+            boolean success = EGraphIntegrityCheck.isCheck(sql) ? EGraphIntegrityCheck.run(state, sql)
+                    : query.execute(state, false);
             if (success) {
                 logExecutedContextStatement(state, query);
                 EGraphContextReplayWriter.record(query.getQueryString());

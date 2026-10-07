@@ -108,6 +108,12 @@ public final class EGraphCorpusCaseWriter {
      */
     public static void recordCase(SQLGlobalState<?, ?> state, String baseQuery, int rowCount,
             List<String> replayQueries, boolean rowsAreDetermined) {
+        // Off unless a replay file is named: the checks below run SQL and are not free, and this is
+        // also called on a mismatch's way out, where nothing should run that could replace it.
+        String replayFileProperty = System.getProperty("egraph.replay.file");
+        if (replayFileProperty == null || replayFileProperty.isBlank()) {
+            return;
+        }
         if (!(state instanceof SQLite3GlobalState) || baseQuery == null
                 || !SQLite3EGraphInputCorpus.isSafeEGraphQueryInput(baseQuery)) {
             return;

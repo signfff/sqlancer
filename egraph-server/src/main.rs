@@ -4,10 +4,14 @@ use axum::{extract::Json, http::StatusCode, response::IntoResponse, routing::pos
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sql_rewrite::generate_equivalent_where_clauses;
-use sqlparser::ast::{Query, Select, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{
+    visit_expressions, BinaryOperator, Expr as SqlExpr, Query, Select, SelectItem, SetExpr, Statement,
+    UnaryOperator,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 #[derive(Deserialize)]
@@ -31,33 +35,32 @@ struct GenerateResponse {
 /// Preprocess SQLite-specific syntax that sqlparser's GenericDialect doesn't handle.
 ///
 /// Uses a placeholder trick to avoid regex look-ahead:
-/// 1. Protect `ISNULL(` / `NOTNULL(` function calls ?placeholder
-/// 2. Convert postfix `ISNULL` / `NOTNULL` ?`IS NULL` / `IS NOT NULL`
-/// 3. Restore function calls from placeholder
-/// 4. Remove `INDEXED BY ident`
+/// 1. Convert postfix `ISNULL` / `NOTNULL` to `IS NULL` / `IS NOT NULL`
+/// 2. Lower an uppercase hex prefix (`0X1F` to `0x1F`)
+/// 3. Remove `INDEXED BY ident` and `NOT INDEXED`
 ///
-/// String literals are masked first so none of these text rewrites reach their contents.
+/// Quoted text - string literals and quoted identifiers - is masked first so none of these text
+/// rewrites reach it: on 2026-10-07 the hex rule turned the literal '...0X3O...' into '...0x3O...'.
 fn preprocess_sqlite_sql(input: &str) -> String {
-    let (masked, literals) = mask_string_literals(input);
+    let (masked, quoted) = mask_quoted(input);
     let s = preprocess_unquoted_sql(&masked);
-    unmask_string_literals(&s, &literals)
+    unmask_quoted(&s, &quoted)
 }
 
-/// Replaces every single-quoted literal (with '' escapes) by \x01<index>\x02.
-/// The placeholder ends in a non-word character, so `'a' ISNULL` stays as unconverted as before.
-fn mask_string_literals(input: &str) -> (String, Vec<String>) {
+/// Replaces every '...', "..." and `...` (with doubled-quote escapes) by \x01<index>\x02.
+fn mask_quoted(input: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(input.len());
-    let mut literals = Vec::new();
+    let mut quoted = Vec::new();
     let mut chars = input.char_indices().peekable();
     while let Some((start, c)) = chars.next() {
-        if c != '\'' {
+        if c != '\'' && c != '"' && c != '`' {
             out.push(c);
             continue;
         }
         let mut end = input.len();
         while let Some((i, d)) = chars.next() {
-            if d == '\'' {
-                if matches!(chars.peek(), Some((_, '\''))) {
+            if d == c {
+                if matches!(chars.peek(), Some((_, e)) if *e == c) {
                     chars.next();
                 } else {
                     end = i + 1;
@@ -65,47 +68,38 @@ fn mask_string_literals(input: &str) -> (String, Vec<String>) {
                 }
             }
         }
-        out.push_str(&format!("\x01{}\x02", literals.len()));
-        literals.push(input[start..end].to_string());
+        out.push_str(&format!("\x01{}\x02", quoted.len()));
+        quoted.push(input[start..end].to_string());
     }
-    (out, literals)
+    (out, quoted)
 }
 
-fn unmask_string_literals(input: &str, literals: &[String]) -> String {
-    if literals.is_empty() {
+fn unmask_quoted(input: &str, quoted: &[String]) -> String {
+    if quoted.is_empty() {
         return input.to_string();
     }
     static RE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new("\x01([0-9]+)\x02").unwrap());
     RE_PLACEHOLDER
-        .replace_all(input, |c: &regex::Captures| literals[c[1].parse::<usize>().unwrap()].clone())
+        .replace_all(input, |c: &regex::Captures| {
+            c[1].parse::<usize>().ok().and_then(|i| quoted.get(i)).cloned().unwrap_or_else(|| c[0].to_string())
+        })
         .to_string()
 }
 
 fn preprocess_unquoted_sql(input: &str) -> String {
+    // An operand ends in a word, a closing bracket, or a masked quoted string (\x02).
     static RE_ISNULL: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(\w+|"[^"]*"|\))\s+ISNULL\b"#).unwrap());
+        LazyLock::new(|| Regex::new(r#"(?i)(\w|\x02|\))\s+ISNULL\b"#).unwrap());
     static RE_NOTNULL: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(\w+|"[^"]*"|\))\s+NOTNULL\b"#).unwrap());
+        LazyLock::new(|| Regex::new(r#"(?i)(\w|\x02|\))\s+NOTNULL\b"#).unwrap());
     static RE_INDEXED: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(?i)\s+INDEXED\s+BY\s+(?:"[^"]*"|`[^`]*`|\w+)"#).unwrap());
-
-    // Step 1: protect function calls ISNULL(...) / NOTNULL(...) from postfix conversion
-    let s = input.replace("ISNULL(", "\x00ISNULL\x00(");
-    let s = s.replace("NOTNULL(", "\x00NOTNULL\x00(");
-
-    // Step 2: convert postfix forms
-    let s = RE_ISNULL.replace_all(&s, "$1 IS NULL").to_string();
+        LazyLock::new(|| Regex::new(r#"(?i)\s+INDEXED\s+BY\s+(?:\x01[0-9]+\x02|\w+)"#).unwrap());
+    let s = RE_ISNULL.replace_all(input, "$1 IS NULL").to_string();
     let s = RE_NOTNULL.replace_all(&s, "$1 IS NOT NULL").to_string();
 
-    // Step 3: restore function calls
-    let s = s.replace("\x00ISNULL\x00(", "ISNULL(");
-    let s = s.replace("\x00NOTNULL\x00(", "NOTNULL(");
-
-    // Step 4: fix uppercase hex prefixes (0X??0x?
-    static RE_0X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"0X([0-9a-fA-F]+)"#).unwrap());
+    static RE_0X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\b0X([0-9a-fA-F]+)"#).unwrap());
     let s = RE_0X.replace_all(&s, "0x$1").to_string();
 
-    // Step 5: remove INDEXED BY xxx
     let s = RE_INDEXED.replace_all(&s, "").to_string();
 
     // Step 6: remove NOT INDEXED (SQLite hint to skip index usage)
@@ -128,6 +122,9 @@ async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoRespons
         match Parser::parse_sql(&dialect, &query_str) {
             Ok(statements) if statements.len() == 1 && !prints_faithfully(&statements[0]) => {
                 Err("the query does not survive printing: sqlparser would change a literal".to_string())
+            }
+            Ok(statements) if statements.len() == 1 && !groups_like_sqlite(&statements[0]) => {
+                Err("sqlparser groups an unbracketed operator differently from SQLite".to_string())
             }
             Ok(statements) if statements.len() == 1 => match &statements[0] {
                 Statement::Query(query) => {
@@ -173,9 +170,103 @@ fn prints_faithfully(statement: &Statement) -> bool {
     }
 }
 
+/// SQLite's binding strength of an operator node, higher binds tighter (lang_expr.html "Operators"):
+/// OR, AND, NOT, the equality family (= <> IS IN LIKE GLOB MATCH REGEXP BETWEEN), the ordering
+/// comparisons, bit operators, + -, * / %, ||, then COLLATE and the prefix operators. None for
+/// anything that is an atom or brackets its own operands (function calls, CASE, CAST, subqueries).
+fn sqlite_binding(expr: &SqlExpr) -> Option<u8> {
+    use BinaryOperator as B;
+    Some(match expr {
+        SqlExpr::BinaryOp { op, .. } => match op {
+            B::Or => 1,
+            B::And => 2,
+            B::Eq | B::NotEq | B::Match | B::Regexp => 4,
+            B::Lt | B::LtEq | B::Gt | B::GtEq => 5,
+            B::BitwiseAnd | B::BitwiseOr | B::PGBitwiseShiftLeft | B::PGBitwiseShiftRight => 6,
+            B::Plus | B::Minus => 7,
+            B::Multiply | B::Divide | B::Modulo => 8,
+            B::StringConcat => 9,
+            _ => return None,
+        },
+        SqlExpr::UnaryOp { op: UnaryOperator::Not, .. } => 3,
+        SqlExpr::UnaryOp { .. } | SqlExpr::Collate { .. } => 10,
+        SqlExpr::IsNull(_)
+        | SqlExpr::IsNotNull(_)
+        | SqlExpr::IsTrue(_)
+        | SqlExpr::IsNotTrue(_)
+        | SqlExpr::IsFalse(_)
+        | SqlExpr::IsNotFalse(_)
+        | SqlExpr::IsDistinctFrom(..)
+        | SqlExpr::IsNotDistinctFrom(..)
+        | SqlExpr::InList { .. }
+        | SqlExpr::InSubquery { .. }
+        | SqlExpr::Between { .. }
+        | SqlExpr::Like { .. }
+        | SqlExpr::ILike { .. } => 4,
+        _ => return None,
+    })
+}
+
+/// Whether sqlparser grouped every unbracketed operator the way SQLite does.
+///
+/// They disagree on three pairs: = and < share a level in sqlparser but not in SQLite, & binds
+/// tighter than | there but not here, and || sits with * there but above it here. `t0.c0 = t1.c1 <
+/// t0.c2` is c0 = (c1 < c2) to SQLite and (c0 = c1) < c2 to sqlparser, whose variants then print
+/// that reading with brackets: on 2026-10-07 all 16 variants of it returned 6 rows against 3 on
+/// trunk. A single-table predicate is caught by the SQLite validator; a two-table one falls back to
+/// the evaluator, which reads the same wrong tree. So such a query is refused instead.
+///
+/// The test: an operand that is itself an operator, written without brackets, must bind at least as
+/// tightly as its parent on the left (SQLite's binary operators group left to right) and strictly
+/// more tightly on the right, and an operand of a prefix or postfix operator at least as tightly.
+fn groups_like_sqlite(statement: &Statement) -> bool {
+    fn operand_ok(parent: u8, child: &SqlExpr, right: bool) -> bool {
+        match sqlite_binding(child) {
+            Some(c) if right => c > parent,
+            Some(c) => c >= parent,
+            None => true,
+        }
+    }
+    visit_expressions(statement, |expr| {
+        let ok = match (sqlite_binding(expr), expr) {
+            (Some(p), SqlExpr::BinaryOp { left, right, .. }) => {
+                operand_ok(p, left, false) && operand_ok(p, right, true)
+            }
+            (Some(p), SqlExpr::IsDistinctFrom(left, right))
+            | (Some(p), SqlExpr::IsNotDistinctFrom(left, right)) => {
+                operand_ok(p, left, false) && operand_ok(p, right, true)
+            }
+            (Some(p), SqlExpr::Like { expr, pattern, .. })
+            | (Some(p), SqlExpr::ILike { expr, pattern, .. }) => {
+                operand_ok(p, expr, false) && operand_ok(p, pattern, true)
+            }
+            (Some(p), SqlExpr::Between { expr, low, high, .. }) => {
+                operand_ok(p, expr, false) && operand_ok(p, low, true) && operand_ok(p, high, true)
+            }
+            (Some(p), SqlExpr::UnaryOp { expr, .. })
+            | (Some(p), SqlExpr::Collate { expr, .. })
+            | (Some(p), SqlExpr::IsNull(expr))
+            | (Some(p), SqlExpr::IsNotNull(expr))
+            | (Some(p), SqlExpr::IsTrue(expr))
+            | (Some(p), SqlExpr::IsNotTrue(expr))
+            | (Some(p), SqlExpr::IsFalse(expr))
+            | (Some(p), SqlExpr::IsNotFalse(expr))
+            | (Some(p), SqlExpr::InList { expr, .. })
+            | (Some(p), SqlExpr::InSubquery { expr, .. }) => operand_ok(p, expr, false),
+            _ => true,
+        };
+        if ok {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    })
+    .is_continue()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{generate_query_variants, preprocess_sqlite_sql, prints_faithfully};
+    use super::{generate_query_variants, groups_like_sqlite, preprocess_sqlite_sql, prints_faithfully};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -214,10 +305,37 @@ mod tests {
             preprocess_sqlite_sql(sql),
             "SELECT * FROM t2 WHERE t2.c0 = 'K0X3O NOT INDEXED x ISNULL INDEXED BY i0 it''s'"
         );
-        assert_eq!(preprocess_sqlite_sql("SELECT 0X1F, 'a''b' ISNULL, c0 ISNULL"), "SELECT 0x1F, 'a''b' ISNULL, c0 IS NULL");
+        assert_eq!(
+            preprocess_sqlite_sql("SELECT 0X1F, t0X1, 'a''b' ISNULL, c0 isnull, \"c 0X1\" NOTNULL FROM t INDEXED BY \"i x\""),
+            "SELECT 0x1F, t0X1, 'a''b' IS NULL, c0 IS NULL, \"c 0X1\" IS NOT NULL FROM t"
+        );
         let variants = generate_variants_for_sql("SELECT * FROM t2 WHERE t2.c0 = 'K0X3O'");
         assert!(!variants.is_empty());
         assert!(variants.iter().all(|v| !v.contains("0x3O")));
+    }
+
+    #[test]
+    fn refuses_operators_sqlparser_groups_differently() {
+        let refused = [
+            "SELECT * FROM t0, t1 WHERE t0.c0 = t1.c1 < t0.c2",
+            "SELECT * FROM t0 WHERE c0 | c1 & c2",
+            "SELECT * FROM t0 WHERE c0 * c1 || c2 = 'x'",
+            "SELECT * FROM t0 WHERE c0 <> c1 >= 2",
+        ];
+        for sql in refused {
+            assert!(!groups_like_sqlite(&parse_one(sql)), "{}", sql);
+        }
+        let accepted = [
+            "SELECT * FROM t0, t1 WHERE (t0.c0 = t1.c1) < t0.c2",
+            "SELECT * FROM t0 WHERE c0 < c1 = c2",
+            "SELECT * FROM t0 WHERE c0 = 1 AND c1 < 2 OR NOT c2 IS NULL",
+            "SELECT * FROM t0 WHERE -c0 * c1 + c2 || 'a' COLLATE nocase LIKE 'x%' AND c0 BETWEEN c1 + 1 AND 5",
+            "SELECT * FROM t0 WHERE (((t0.c0)=('K0X3O'))) AND c1 IN (1, 2) = 1",
+            "SELECT * FROM t0 WHERE c0 & c1 | c2 AND c0 << 2 >= c1",
+        ];
+        for sql in accepted {
+            assert!(groups_like_sqlite(&parse_one(sql)), "{}", sql);
+        }
     }
 
     fn parse_one(sql: &str) -> Statement {

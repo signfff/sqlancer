@@ -328,9 +328,6 @@ public class SQLite3Provider extends SQLProviderAdapter<SQLite3GlobalState, SQLi
             // also do an abort for DEFERRABLE INITIALLY DEFERRED
             query = SQLite3TransactionGenerator.generateRollbackTransaction(globalState);
             globalState.executeStatement(query);
-            if (isEGraph) {
-                replayEGraphInputCorpus(globalState);
-            }
         }
     }
 
@@ -448,54 +445,6 @@ public class SQLite3Provider extends SQLProviderAdapter<SQLite3GlobalState, SQLi
         query = SQLite3TransactionGenerator.generateRollbackTransaction(globalState);
         globalState.executeStatement(query);
         globalState.updateSchema();
-    }
-
-    private boolean replayEGraphInputCorpus(SQLite3GlobalState globalState) throws Exception {
-        if (!SQLite3EGraphInputCorpus.isConfigured(globalState.getDbmsSpecificOptions())) {
-            return false;
-        }
-        addSensiblePragmaDefaults(globalState);
-        boolean executedSetupStatement = false;
-        boolean schemaChanged = false;
-        for (String statement : SQLite3EGraphInputCorpus.readSetupStatements(globalState.getDbmsSpecificOptions())) {
-            try {
-                SQLQueryAdapter query = new SQLQueryAdapter(statement, corpusStatementCouldAffectSchema(statement));
-                if (query.execute(globalState, false)) {
-                    executedSetupStatement = true;
-                    logExecutedCorpusStatement(globalState, query);
-                    schemaChanged |= query.couldAffectSchema();
-                }
-            } catch (AssertionError ignored) {
-            } catch (RuntimeException ignored) {
-            } catch (Exception ignored) {
-            }
-        }
-        try {
-            if (schemaChanged) {
-                globalState.updateSchema();
-            }
-        } catch (AssertionError ignored) {
-            return false;
-        } catch (RuntimeException ignored) {
-            return false;
-        }
-        return executedSetupStatement && !globalState.getSchema().getDatabaseTables().isEmpty();
-    }
-
-    private static boolean corpusStatementCouldAffectSchema(String statement) {
-        String normalized = statement.stripLeading().toUpperCase(java.util.Locale.ROOT);
-        return normalized.matches("(?s)^(CREATE|DROP|ALTER)\\b.*")
-                || normalized.matches("(?s).*\\b(CREATE|DROP|ALTER)\\s+(TABLE|INDEX|VIEW|TRIGGER|VIRTUAL)\\b.*");
-    }
-
-    private static void logExecutedCorpusStatement(SQLite3GlobalState globalState, SQLQueryAdapter query) {
-        if (globalState.getState() != null) {
-            globalState.getState().logStatement(query);
-        }
-        if (globalState.getOptions() != null && globalState.getOptions().logEachSelect()
-                && globalState.getLogger() != null) {
-            globalState.getLogger().writeCurrent(query.getQueryString());
-        }
     }
 
     private static void checkTablesForGeneratedColumnLoops(SQLite3GlobalState globalState) throws Exception {
