@@ -506,9 +506,11 @@ fn generate_select_variants(
 }
 
 /// `egraph-server --novelty rules.txt`: for each `name ; lhs => rhs`, whether the rules already in
-/// the server derive it. Both sides go into one e-graph with their variables as shared symbols, the
-/// current rules (swaps included, so the answer is an upper bound on what they reach) saturate it,
-/// and the rule is DERIVABLE when the two land in one e-class. NEW means not within the limits,
+/// the server derive it. The lhs goes into an e-graph with its variables as symbols, the current
+/// rules (swaps included, so the answer is an upper bound on what they reach) saturate it, and the
+/// rule is DERIVABLE when the rhs is then in the lhs's e-class. Only from the lhs: the server grows
+/// variants from the query it was given, so a rule whose rhs is reachable only by starting from the
+/// rhs (isnull-expand, through not-isnotnull) still adds something. NEW means not within the limits,
 /// which is what a candidate rule has to show to be worth adding.
 fn novelty(path: &str) {
     use egg::{RecExpr, Runner};
@@ -541,9 +543,9 @@ fn novelty(path: &str) {
             .with_node_limit(200_000)
             .with_time_limit(std::time::Duration::from_secs(10))
             .with_expr(&l)
-            .with_expr(&r)
             .run(&rules);
-        let same = runner.egraph.find(runner.roots[0]) == runner.egraph.find(runner.roots[1]);
+        let same = runner.egraph.lookup_expr(&r).map(|id| runner.egraph.find(id))
+            == Some(runner.egraph.find(runner.roots[0]));
         println!(
             "{:<10} {:<34} {} iterations, {} nodes, stopped: {:?}",
             if same { "DERIVABLE" } else { "NEW" },
@@ -555,11 +557,90 @@ fn novelty(path: &str) {
     }
 }
 
+/// `egraph-server --usage rules.txt queries.txt`: for each candidate rule, on how many of the base
+/// queries (one SELECT per line) it would add something the current rules do not. Each WHERE is
+/// saturated by the current rules to a fixed point (under the server's collation guard), then the candidate
+/// is applied once to a copy: a query counts when it matched, and counts as NEW EQUALITIES when the
+/// application merged e-classes or added terms, i.e. made variants reachable that were not before.
+/// Deterministic, unlike the variants themselves, whose extraction is random.
+fn usage(rules_path: &str, queries_path: &str) {
+    use egg::{Pattern, RecExpr, Rewrite};
+    let candidates: Vec<(String, Rewrite<sql_rewrite::SqlLang, ()>)> = std::fs::read_to_string(rules_path)
+        .expect("cannot read rules file")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|line| {
+            let (name, body) = line.split_once(';')?;
+            let (lhs, rhs) = body.split_once("=>")?;
+            let lhs: Pattern<sql_rewrite::SqlLang> = lhs.trim().parse().ok()?;
+            let rhs: Pattern<sql_rewrite::SqlLang> = rhs.trim().parse().ok()?;
+            Some((name.trim().to_string(), Rewrite::new(name.trim(), lhs, rhs).ok()?))
+        })
+        .collect();
+    let mut matched = vec![0usize; candidates.len()];
+    let mut added = vec![0usize; candidates.len()];
+    let mut usable = 0usize;
+    let mut unsaturated = 0usize;
+    for line in std::fs::read_to_string(queries_path).expect("cannot read queries").lines() {
+        let query_str = preprocess_sqlite_sql(line.trim());
+        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, &query_str) else { continue };
+        let Some(Statement::Query(query)) = statements.first() else { continue };
+        let SetExpr::Select(select) = query.body.as_ref() else { continue };
+        let Some(selection) = &select.selection else { continue };
+        let (rec, _): (RecExpr<sql_rewrite::SqlLang>, _) = sql_rewrite::sql_expr_to_recexpr(selection, &query_str);
+        if matches!(rec.as_ref().last(), Some(sql_rewrite::SqlLang::Symbol(_)) | None) {
+            continue;
+        }
+        let allow_swap = !sql_rewrite::compares_columns_of_unknown_collation(selection);
+        // Saturated to a fixed point, not to the server's budget: on an e-graph the current rules
+        // could still grow, a redundant candidate also "adds" something, which measured 500 of 2771
+        // queries for rules --novelty proves derivable.
+        let runner = egg::Runner::default()
+            .with_iter_limit(60)
+            .with_node_limit(30_000)
+            .with_time_limit(std::time::Duration::from_secs(1))
+            .with_expr(&rec)
+            .run(&sql_rewrite::make_rewrite_rules(allow_swap));
+        if !matches!(runner.stop_reason, Some(egg::StopReason::Saturated)) {
+            unsaturated += 1;
+            continue;
+        }
+        usable += 1;
+        let egraph = runner.egraph;
+        for (i, (_, rule)) in candidates.iter().enumerate() {
+            let matches = rule.search(&egraph);
+            if matches.is_empty() {
+                continue;
+            }
+            matched[i] += 1;
+            let mut copy = egraph.clone();
+            let before = (copy.number_of_classes(), copy.total_number_of_nodes());
+            let changed = rule.apply(&mut copy, &matches);
+            copy.rebuild();
+            if !changed.is_empty() || (copy.number_of_classes(), copy.total_number_of_nodes()) != before {
+                added[i] += 1;
+            }
+        }
+    }
+    println!(
+        "{} base queries saturated and counted; {} did not saturate within the limits and were skipped",
+        usable, unsaturated
+    );
+    for (i, (name, _)) in candidates.iter().enumerate() {
+        println!("{:<34} matched {:>5}  new equalities {:>5}", name, matched[i], added[i]);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "--novelty" {
         novelty(&args[2]);
+        return;
+    }
+    if args.len() == 4 && args[1] == "--usage" {
+        usage(&args[2], &args[3]);
         return;
     }
     let app = Router::new().route("/generate-variants", post(generate_variants));

@@ -43,8 +43,15 @@ BINARY = {"and": "AND", "or": "OR", "=": "=", "<>": "<>", "<": "<", ">": ">", "<
 PREFIX = {"not": "NOT", "neg": "-", "bitnot": "~"}
 POSTFIX = {"isnull": "IS NULL", "isnotnull": "IS NOT NULL", "istrue": "IS TRUE", "isfalse": "IS FALSE",
            "isnottrue": "IS NOT TRUE", "isnotfalse": "IS NOT FALSE"}
+EXTENSION = {"is": "({} IS {})", "isnot": "({} IS NOT {})", "uplus": "(+{})",
+             "in": "({} IN {})", "notin": "({} NOT IN {})", "list2": "({}, {})",
+             "iif": "iif({}, {}, {})", "case": "(CASE WHEN {} THEN {} ELSE {} END)",
+             "coalesce": "coalesce({}, {})", "ifnull": "ifnull({}, {})", "nullif": "nullif({}, {})",
+             "cast_int": "CAST({} AS INTEGER)", "cast_real": "CAST({} AS REAL)",
+             "cast_text": "CAST({} AS TEXT)", "cast_numeric": "CAST({} AS NUMERIC)"}
 # Operators whose result is a value that can carry a collation onward, not a truth value.
-VALUE_OPS = {"+", "-", "*", "/", "rem", "concat", "bitand", "bitor", "neg", "bitnot"}
+VALUE_OPS = {"+", "-", "*", "/", "rem", "concat", "bitand", "bitor", "neg", "bitnot", "uplus", "iif", "case",
+             "coalesce", "ifnull", "nullif", "cast_int", "cast_real", "cast_text", "cast_numeric"}
 
 # Context around a value-producing side: (template, operand) with {e} for the side.
 COMPARISON_PARTNERS = ["'ABC'", "'abc '", "1", "w.c_text", "w.c_nocase"]
@@ -99,6 +106,10 @@ def to_sql(tree, binding):
         return "(%s %s)" % (args[0], POSTFIX[op])
     if op == "between":
         return "(%s BETWEEN %s AND %s)" % tuple(args)
+    # Nodes the server's language does not have yet, so candidate rules that need them can be
+    # judged before anyone implements them.
+    if op in EXTENSION:
+        return EXTENSION[op].format(*args)
     raise ValueError("unknown operator " + op)
 
 

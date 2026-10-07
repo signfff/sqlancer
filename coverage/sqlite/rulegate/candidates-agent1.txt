@@ -1,0 +1,94 @@
+# Candidate rewrite rules (agent1). Nothing here has been run yet: every rule should go through rulegate before use.
+# Background facts these arguments rely on:
+#   - NOT/AND/OR/comparisons return only 0, 1 or NULL (integers). IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE/ISNULL/NOTNULL return only 0 or 1, never NULL.
+#   - AND, OR, NOT, IS TRUE and the WHERE jump opcodes all decide truth with sqlite3VdbeBooleanValue
+#     (integer != 0, otherwise realvalue != 0.0, NULL is unknown), so TEXT/BLOB/REAL are judged the same way everywhere.
+#   - None of these rules move an operand to a different comparison or swap operand sides, so affinity and collation choices do not change.
+#   - Rules that use ?x twice would change results if ?x is non-deterministic, e.g. random(). Existing rules such as eq-to-tight already accept this risk.
+
+## Part A — inside the current language
+
+istrue-to-and-notnull ; (istrue ?x) => (and ?x (isnotnull ?x))
+#   x NULL: 0 vs (NULL AND 0)=0; x true: 1 vs 1 AND 1=1; x false: 0 vs 0 — RHS is never NULL and always 0/1, same as LHS.
+isfalse-to-and-notnull ; (isfalse ?x) => (and (not ?x) (isnotnull ?x))
+#   x NULL: 0 vs (NULL AND 0)=0; x false: 1 vs 1 AND 1=1; x true: 0 vs 0 AND 1=0.
+isnottrue-to-or-null ; (isnottrue ?x) => (or (not ?x) (isnull ?x))
+#   x NULL: 1 vs (NULL OR 1)=1; x false: 1 vs 1; x true: 0 vs (0 OR 0)=0.
+isnotfalse-to-or-null ; (isnotfalse ?x) => (or ?x (isnull ?x))
+#   x NULL: 1 vs (NULL OR 1)=1; x true: 1 vs 1 (OR yields 1, not x itself); x false: 0 vs 0 OR 0=0.
+isfalse-to-istrue-not ; (isfalse ?x) => (istrue (not ?x))
+#   NOT maps true->0, false->1, NULL->NULL, and IS TRUE of NULL is 0, so both sides give 1 exactly when x is false. Sound in both directions.
+istrue-to-isfalse-not ; (istrue ?x) => (isfalse (not ?x))
+#   NOT x is 0 exactly when x is true. NULL stays NULL, and IS FALSE of NULL is 0. Sound in both directions.
+not-istrue ; (not (istrue ?x)) => (isnottrue ?x)
+#   IS TRUE is never NULL, so NOT of it is the plain 0/1 complement, which is exactly IS NOT TRUE. Add the reverse direction too.
+not-isfalse ; (not (isfalse ?x)) => (isnotfalse ?x)
+#   Same argument as not-istrue: IS FALSE is never NULL. Add the reverse direction too.
+istrue-and-dist ; (istrue (and ?x ?y)) => (and (istrue ?x) (istrue ?y))
+#   x AND y is true iff both are true. The RHS operands are never NULL, so the RHS is 0/1 like the LHS.
+istrue-or-dist ; (istrue (or ?x ?y)) => (or (istrue ?x) (istrue ?y))
+#   x OR y is true iff at least one is true. The RHS is never NULL.
+isfalse-and-dist ; (isfalse (and ?x ?y)) => (or (isfalse ?x) (isfalse ?y))
+#   Under three-valued AND, the result is false iff at least one operand is false (NULL AND 0 = 0).
+isfalse-or-dist ; (isfalse (or ?x ?y)) => (and (isfalse ?x) (isfalse ?y))
+#   Under three-valued OR, the result is false iff both operands are false (NULL OR 0 = NULL, not false).
+triple-not ; (not (not (not ?x))) => (not ?x)
+#   NOT x is already in {0,1,NULL}, and on that set NOT NOT is the identity, value for value. Unlike the removed not-not rule, this holds even where the value is observed.
+not-not-and ; (not (not (and ?x ?y))) => (and ?x ?y)
+#   AND returns only 0/1/NULL, so a double NOT gives back the same value. Chaining the existing rules cannot derive this, because De Morgan pushes the NOTs onto x and y.
+not-not-or ; (not (not (or ?x ?y))) => (or ?x ?y)
+#   OR returns only 0/1/NULL, so a double NOT is the identity on its result.
+isnull-not ; (isnull (not ?x)) => (isnull ?x)
+#   NOT returns NULL iff its operand is NULL. For any non-NULL value, including TEXT/BLOB, it returns 0 or 1.
+isnull-concat ; (isnull (concat ?x ?y)) => (or (isnull ?x) (isnull ?y))
+#   OP_Concat returns NULL iff either operand is NULL. An oversized result raises an error rather than returning NULL, and the error happens on both sides. Not valid for + - * / %, because Inf-Inf and Inf*0 are NaN, which SQLite stores as NULL, and division by zero also gives NULL.
+isnull-bitand ; (isnull (bitand ?x ?y)) => (or (isnull ?x) (isnull ?y))
+#   & returns NULL iff an operand is NULL, otherwise it converts both to int64 and never gives NULL. The same rule holds for bitor (isnull-bitor).
+isnull-lt ; (isnull (< ?x ?y)) => (or (isnull ?x) (isnull ?y))
+#   Plain comparisons (not IS) return NULL iff an operand is NULL, and affinity conversion never produces NULL. The same holds for <= > >= = <>, so add one rule per operator.
+isnull-neg ; (isnull (neg ?x)) => (isnull ?x)
+#   Unary minus is 0-x: TEXT/BLOB become numbers, so they are never NULL; -MIN overflows to REAL, not NULL; NaN cannot be stored, so 0-(+/-Inf) is never NaN. The same holds for bitnot (isnull-bitnot).
+
+## Part B — would need new nodes
+
+B1 node: is (x IS y)
+is-expand ; (is ?x ?y) => (or (and (isnull ?x) (isnull ?y)) (and (and (isnotnull ?x) (isnotnull ?y)) (= ?x ?y)))
+#   IS uses the same affinity and collation as =, but treats NULL as a value. If exactly one side is NULL, both disjuncts are 0. If neither is NULL, = gives 0/1. The result is never NULL, matching IS. The operand order of = is kept, so the collation choice is the same.
+
+B2 nodes: is, isnot
+isnot-to-not-is ; (isnot ?x ?y) => (not (is ?x ?y))
+#   IS is never NULL, so NOT gives the exact 0/1 complement. Sound in both directions.
+
+B3 node: is (symmetry)
+is-sym ; (is ?x ?y) => (is ?y ?x)
+#   Same caveat as eq-sym: with two columns of different collations, the left one's collation wins. Enable it only behind the existing collation gate. Affinity is symmetric.
+
+B4 nodes: in, list2 (x IN (a,b)), uplus (unary +, which strips affinity)
+in-to-or ; (in ?x (list2 ?a ?b)) => (or (= ?x (uplus ?a)) (= ?x (uplus ?b)))
+#   The SQLite docs say a IN (x,y) behaves like a=+x OR a=+y for affinity: the list items have no affinity. NULL handling matches: no match plus a NULL item gives NULL in both forms.
+#   CAVEAT (unsure): for a list, IN takes its collation only from the LHS, but = with an LHS that has no collation (e.g. x+0) takes the collation of the right column, and I believe unary + passes the collation through. This is sound only when ?x is a column, has an explicit COLLATE, or the list items carry no collation. That needs a gate.
+
+B5 nodes: notin, list2, uplus
+notin-to-and ; (notin ?x (list2 ?a ?b)) => (and (<> ?x (uplus ?a)) (<> ?x (uplus ?b)))
+#   x NOT IN (a,NULL) with x<>a gives NULL, and so does 1 AND NULL. A NULL x with a non-empty list gives NULL in both forms. It has the same collation caveat as B4.
+
+B6 nodes: iif, case (CASE WHEN c THEN a ELSE b END)
+iif-to-case ; (iif ?c ?a ?b) => (case ?c ?a ?b)
+#   SQLite parses iif() directly into this CASE (same result values, no affinity added), so this mostly helps reach the other CASE rules. Low value on its own.
+
+B7 node: case
+case-swap ; (case ?c ?a ?b) => (case (isnottrue ?c) ?b ?a)
+#   Swapping the branches with plain NOT would be UNSOUND: NULL goes to ELSE both before and after, so the result changes. IS NOT TRUE sends NULL to b, as the original does. Each branch value is returned unchanged.
+
+B8 node: coalesce (2 args; ifnull is the same)
+isnull-coalesce ; (isnull (coalesce ?x ?y)) => (and (isnull ?x) (isnull ?y))
+#   coalesce/ifnull is NULL iff every argument is NULL. Both sides give 0/1, and no comparison is involved, so affinity and collation do not matter.
+
+B9 nodes: nullif, uplus
+isnull-nullif ; (isnull (nullif ?x ?y)) => (or (isnull ?x) (istrue (= (uplus ?x) (uplus ?y))))
+#   nullif(x,y) is NULL iff x is NULL or x equals y. Plain (= x y) would be UNSOUND, because nullif, being a function, applies no column affinity (nullif(intcol,'1') does not match 1 but intcol='1' does), so uplus has to strip the affinity.
+#   UNSURE: nullif picks its collation from the first argument that has one, and = picks the left one first. That agrees in the cases I can think of, but rulegate needs to check it with NOCASE/RTRIM columns.
+
+B10 node: cast_int (CAST(x AS INTEGER)); likewise cast_real, cast_text
+cast-int-idem ; (cast_int (cast_int ?x)) => (cast_int ?x)
+#   CAST AS INTEGER always returns an int64 (or NULL for NULL), and casting an int64 to INTEGER is a no-op. CAST AS REAL and AS TEXT are also idempotent. I am UNSURE about CAST AS NUMERIC on REAL values above 2^63 and on Inf (it may convert to INTEGER differently the second time), so I did not include NUMERIC.
