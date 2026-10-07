@@ -65,7 +65,11 @@ public final class EGraphIntegrityCheck {
         } catch (SQLException | RuntimeException e) {
             return false;
         }
-        if (rows.size() == 1 && "ok".equalsIgnoreCase(rows.get(0).strip())) {
+        // SQLancer issues PRAGMA ignore_check_constraints = true at random, and rows inserted while it
+        // is on break their CHECK constraints for good, which the checks then report - as documented.
+        // Measured 2026-10-07: every report of the first optmask4 hour was that.
+        rows.removeIf(r -> r.startsWith("CHECK constraint failed in "));
+        if (rows.isEmpty() || rows.size() == 1 && "ok".equalsIgnoreCase(rows.get(0).strip())) {
             return true;
         }
         record(state, sql, rows);
