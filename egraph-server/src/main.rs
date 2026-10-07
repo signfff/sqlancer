@@ -505,8 +505,63 @@ fn generate_select_variants(
         .collect())
 }
 
+/// `egraph-server --novelty rules.txt`: for each `name ; lhs => rhs`, whether the rules already in
+/// the server derive it. Both sides go into one e-graph with their variables as shared symbols, the
+/// current rules (swaps included, so the answer is an upper bound on what they reach) saturate it,
+/// and the rule is DERIVABLE when the two land in one e-class. NEW means not within the limits,
+/// which is what a candidate rule has to show to be worth adding.
+fn novelty(path: &str) {
+    use egg::{RecExpr, Runner};
+    let rules = sql_rewrite::make_rewrite_rules(true);
+    let text = std::fs::read_to_string(path).expect("cannot read rules file");
+    static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((name, body)) = line.split_once(';') else { continue };
+        let Some((lhs, rhs)) = body.split_once("=>") else { continue };
+        let mut names: Vec<String> = Vec::new();
+        let mut symbolise = |s: &str| {
+            VAR.replace_all(s.trim(), |c: &regex::Captures| {
+                let i = names.iter().position(|n| n == &c[1]).unwrap_or_else(|| {
+                    names.push(c[1].to_string());
+                    names.len() - 1
+                });
+                format!("{}", 900_001 + i)
+            })
+            .to_string()
+        };
+        let (l, r) = (symbolise(lhs), symbolise(rhs));
+        let parsed: Result<(RecExpr<sql_rewrite::SqlLang>, RecExpr<sql_rewrite::SqlLang>), _> =
+            l.parse().and_then(|a| r.parse().map(|b| (a, b)));
+        let Ok((l, r)) = parsed else {
+            println!("ERROR      {:<34} cannot parse", name.trim());
+            continue;
+        };
+        let runner = Runner::default()
+            .with_iter_limit(30)
+            .with_node_limit(200_000)
+            .with_time_limit(std::time::Duration::from_secs(10))
+            .with_expr(&l)
+            .with_expr(&r)
+            .run(&rules);
+        let same = runner.egraph.find(runner.roots[0]) == runner.egraph.find(runner.roots[1]);
+        println!(
+            "{:<10} {:<34} {} iterations, {} nodes, stopped: {:?}",
+            if same { "DERIVABLE" } else { "NEW" },
+            name.trim(),
+            runner.iterations.len(),
+            runner.egraph.total_number_of_nodes(),
+            runner.stop_reason
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--novelty" {
+        novelty(&args[2]);
+        return;
+    }
     let app = Router::new().route("/generate-variants", post(generate_variants));
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("Server running on http://{}", addr);

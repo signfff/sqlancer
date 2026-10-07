@@ -1037,7 +1037,7 @@ fn disabled_rules() -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
-fn make_rewrite_rules(allow_operand_swap: bool) -> Vec<Rewrite<SqlLang, ()>> {
+pub(crate) fn make_rewrite_rules(allow_operand_swap: bool) -> Vec<Rewrite<SqlLang, ()>> {
     let mut rules = make_base_rewrite_rules();
     if extra_rules_enabled() {
         rules.extend(make_extra_comparison_rules());

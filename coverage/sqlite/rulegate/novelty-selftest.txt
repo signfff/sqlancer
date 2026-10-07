@@ -1,0 +1,7 @@
+# derivable from existing rules
+gt-to-lt-copy ; (> ?a ?b) => (< ?b ?a)
+two-step ; (not (< ?a ?b)) => (<= ?b ?a)
+or-to-and-dm ; (or ?a ?b) => (not (and (not ?a) (not ?b)))
+# not derivable (new)
+isnull-expand ; (isnull ?x) => (not (isnotnull ?x))
+between-swap-bounds-bad ; (between ?x ?lo ?hi) => (between ?x ?hi ?lo)
