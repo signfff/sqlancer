@@ -35,7 +35,53 @@ struct GenerateResponse {
 /// 2. Convert postfix `ISNULL` / `NOTNULL` ?`IS NULL` / `IS NOT NULL`
 /// 3. Restore function calls from placeholder
 /// 4. Remove `INDEXED BY ident`
+///
+/// String literals are masked first so none of these text rewrites reach their contents.
 fn preprocess_sqlite_sql(input: &str) -> String {
+    let (masked, literals) = mask_string_literals(input);
+    let s = preprocess_unquoted_sql(&masked);
+    unmask_string_literals(&s, &literals)
+}
+
+/// Replaces every single-quoted literal (with '' escapes) by \x01<index>\x02.
+/// The placeholder ends in a non-word character, so `'a' ISNULL` stays as unconverted as before.
+fn mask_string_literals(input: &str) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(input.len());
+    let mut literals = Vec::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+        let mut end = input.len();
+        while let Some((i, d)) = chars.next() {
+            if d == '\'' {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    chars.next();
+                } else {
+                    end = i + 1;
+                    break;
+                }
+            }
+        }
+        out.push_str(&format!("\x01{}\x02", literals.len()));
+        literals.push(input[start..end].to_string());
+    }
+    (out, literals)
+}
+
+fn unmask_string_literals(input: &str, literals: &[String]) -> String {
+    if literals.is_empty() {
+        return input.to_string();
+    }
+    static RE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new("\x01([0-9]+)\x02").unwrap());
+    RE_PLACEHOLDER
+        .replace_all(input, |c: &regex::Captures| literals[c[1].parse::<usize>().unwrap()].clone())
+        .to_string()
+}
+
+fn preprocess_unquoted_sql(input: &str) -> String {
     static RE_ISNULL: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"(\w+|"[^"]*"|\))\s+ISNULL\b"#).unwrap());
     static RE_NOTNULL: LazyLock<Regex> =
@@ -158,6 +204,20 @@ mod tests {
         assert!(!variants.is_empty());
         assert!(variants.iter().all(|v| !v.contains("X'7979'")));
         assert!(variants.iter().any(|v| v.contains("0x7979")));
+    }
+
+    #[test]
+    fn preprocessing_leaves_string_literals_alone() {
+        // From the optmask2 trunk run: '...0X3O...' became '...0x3O...', so every variant missed the row.
+        let sql = "SELECT * FROM t2 NOT INDEXED WHERE t2.c0 = 'K0X3O NOT INDEXED x ISNULL INDEXED BY i0 it''s'";
+        assert_eq!(
+            preprocess_sqlite_sql(sql),
+            "SELECT * FROM t2 WHERE t2.c0 = 'K0X3O NOT INDEXED x ISNULL INDEXED BY i0 it''s'"
+        );
+        assert_eq!(preprocess_sqlite_sql("SELECT 0X1F, 'a''b' ISNULL, c0 ISNULL"), "SELECT 0x1F, 'a''b' ISNULL, c0 IS NULL");
+        let variants = generate_variants_for_sql("SELECT * FROM t2 WHERE t2.c0 = 'K0X3O'");
+        assert!(!variants.is_empty());
+        assert!(variants.iter().all(|v| !v.contains("0x3O")));
     }
 
     fn parse_one(sql: &str) -> Statement {

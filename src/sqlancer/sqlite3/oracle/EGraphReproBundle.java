@@ -44,7 +44,8 @@ public final class EGraphReproBundle {
 
     /** Saves one bundle, unless switched off or past a limit. Never throws: the check's own reporting comes first. */
     public static void save(File databaseFile, String source, String rewriteQuery, String originalQuery,
-            String variantQuery, int variantMask, List<String> originalRows, List<String> variantRows) {
+            String variantQuery, int variantMask, List<String> originalRows, List<String> variantRows,
+            List<String> tempStatements) {
         if (DIR.isBlank() || databaseFile == null || !databaseFile.isFile()) {
             return;
         }
@@ -62,6 +63,10 @@ public final class EGraphReproBundle {
             String nl = System.lineSeparator();
             StringBuilder replay = new StringBuilder();
             for (String statement : EGraphContextSnapshot.current()) {
+                replay.append(terminate(statement)).append(nl);
+            }
+            // TEMP tables live in the connection, not the file (see EGraphTempSchemaDump).
+            for (String statement : tempStatements) {
                 replay.append(terminate(statement)).append(nl);
             }
             replay.append(".print == original (default optimizations)").append(nl);

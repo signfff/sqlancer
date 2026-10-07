@@ -69,15 +69,17 @@ public final class EGraphTrunkReferee {
      *                     disturbed and the referee cannot write to it
      */
     public static Verdict judge(File databaseFile, String originalQuery, String variantQuery) {
-        return judge(databaseFile, originalQuery, variantQuery, 0);
+        return judge(databaseFile, originalQuery, variantQuery, 0, List.of());
     }
 
     /**
      * @param variantMask optimizer flags the variant ran under (see EGraphOptimizerMask), replayed with
      *                    sqlancer_optimizations() before it; 0 for the default. Without it a defect the mask exposed
      *                    would not reproduce here, be judged FIXED_UPSTREAM and end up suppressed as a known bug.
+     * @param tempStatements the connection's TEMP tables and rows (see EGraphTempSchemaDump), replayed after the context
      */
-    public static Verdict judge(File databaseFile, String originalQuery, String variantQuery, int variantMask) {
+    public static Verdict judge(File databaseFile, String originalQuery, String variantQuery, int variantMask,
+            List<String> tempStatements) {
         if (!isConfigured()) {
             return Verdict.UNKNOWN;
         }
@@ -89,8 +91,8 @@ public final class EGraphTrunkReferee {
         try {
             copy = Files.createTempFile("egraph-referee", ".db");
             Files.copy(databaseFile.toPath(), copy, StandardCopyOption.REPLACE_EXISTING);
-            String original = run(copy, originalQuery, 0);
-            String variant = run(copy, variantQuery, variantMask);
+            String original = run(copy, originalQuery, 0, tempStatements);
+            String variant = run(copy, variantQuery, variantMask, tempStatements);
             if (original == null || variant == null) {
                 FAILED.incrementAndGet();
                 unanswered(original == null ? "original-did-not-run" : "variant-did-not-run",
@@ -205,10 +207,13 @@ public final class EGraphTrunkReferee {
     private static final String MARKER = "EGRAPH_REFEREE_OUTPUT_BEGINS";
 
     /** The query's output under the trunk build, or null when the build could not run it. */
-    private static String run(Path database, String query, int mask) throws IOException, InterruptedException {
+    private static String run(Path database, String query, int mask, List<String> tempStatements)
+            throws IOException, InterruptedException {
         List<String> command = new ArrayList<>(List.of(COMMAND.split("\\s+")));
         command.add(translatePath(database));
         Path script = Files.createTempFile("egraph-referee", ".sql");
+        // To a file: a pipe nobody drains blocks the shell once context errors fill it.
+        Path errors = Files.createTempFile("egraph-referee", ".err");
         try {
             StringBuilder sql = new StringBuilder();
             // The wrapper shapes reach for tables the context setup created, some of them in
@@ -220,18 +225,27 @@ public final class EGraphTrunkReferee {
                 sql.append(stripTrailingSemicolon(statement)).append(';').append(System.lineSeparator());
                 statementCount++;
             }
+            for (String statement : tempStatements) {
+                sql.append(stripTrailingSemicolon(statement)).append(';').append(System.lineSeparator());
+                statementCount++;
+            }
             if (mask != 0) {
                 // Before the marker, so the function's own output is not taken for the query's.
                 sql.append("SELECT sqlancer_optimizations(").append(Integer.toUnsignedString(mask)).append(");")
                         .append(System.lineSeparator());
             }
             sql.append("SELECT '").append(MARKER).append("';").append(System.lineSeparator());
+            // The shell names the line an error came from, which tells the query's own error from a
+            // context statement's (.bail on cannot: it quits at once if anything before it failed).
+            // An error goes to stderr only, and an unseen one read as zero rows - that made a missing
+            // TEMP table look FIXED_UPSTREAM.
+            String queryLine = "near line " + (sql.chars().filter(c -> c == '\n').count() + 1) + ":";
             sql.append(stripTrailingSemicolon(query)).append(';').append(System.lineSeparator());
             Files.writeString(script, sql.toString(),
                     StandardCharsets.UTF_8, StandardOpenOption.TRUNCATE_EXISTING);
             ProcessBuilder builder = new ProcessBuilder(command);
             builder.redirectInput(script.toFile());
-            builder.redirectErrorStream(false);
+            builder.redirectError(errors.toFile());
             Process process = builder.start();
             String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
@@ -248,10 +262,17 @@ public final class EGraphTrunkReferee {
                         + " context statements";
                 return null;
             }
+            for (String error : Files.readAllLines(errors, StandardCharsets.UTF_8)) {
+                if (error.contains(queryLine)) {
+                    lastFailure = "query failed: " + error.strip();
+                    return null;
+                }
+            }
             int afterMarker = output.indexOf('\n', marker);
             return afterMarker < 0 ? "" : normalise(output.substring(afterMarker + 1));
         } finally {
             Files.deleteIfExists(script);
+            Files.deleteIfExists(errors);
         }
     }
 

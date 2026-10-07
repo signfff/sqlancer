@@ -335,8 +335,11 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                     }
                 } catch (AssertionError e) {
                     // Before anything classifies it: a filed-away mismatch keeps no data otherwise.
+                    java.util.List<String> tempStatements = state == null ? java.util.List.of()
+                            : sqlancer.sqlite3.oracle.EGraphTempSchemaDump.statements(state.getConnection());
                     sqlancer.sqlite3.oracle.EGraphReproBundle.save(currentDatabaseFile(state), querySource,
-                            rewriteQuery, originalQuery, variantQuery, currentMask, originalResult, variantResult);
+                            rewriteQuery, originalQuery, variantQuery, currentMask, originalResult, variantResult,
+                            tempStatements);
                     if (currentMask != 0) {
                         attributeMaskedFinding(generatedQuery.truncation(), originalQuery, variantQuery,
                                 originalResult, variantResult);
@@ -348,7 +351,7 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                     sqlancer.sqlite3.oracle.EGraphTrunkReferee.Verdict verdict = sqlancer.sqlite3.oracle.EGraphTrunkReferee
                             .isConfigured()
                                     ? sqlancer.sqlite3.oracle.EGraphTrunkReferee.judge(currentDatabaseFile(state),
-                                            originalQuery, variantQuery, currentMask)
+                                            originalQuery, variantQuery, currentMask, tempStatements)
                                     : null;
                     if (verdict == sqlancer.sqlite3.oracle.EGraphTrunkReferee.Verdict.FIXED_UPSTREAM
                             || verdict == sqlancer.sqlite3.oracle.EGraphTrunkReferee.Verdict.UNSTABLE_QUERY) {
