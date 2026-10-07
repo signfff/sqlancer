@@ -1196,7 +1196,7 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
             .getInteger("egraph.emptyBaseCheckPercent", 10);
 
     private static final boolean AUTO_RESEARCH_GUIDED_SHAPES = Boolean
-            .parseBoolean(System.getProperty("sqlite3.egraph.autoResearchGuidedShapes", "false"));
+            .parseBoolean(System.getProperty("sqlite3.egraph.autoResearchGuidedShapes", "true"));
     private static final String AUTO_RESEARCH_RESULTS = System.getProperty("sqlite3.egraph.autoResearchResults",
             "D:\\sqlancer\\coverage\\sqlite\\auto-research-from-long-20260818-130511\\auto-research-results.csv");
     /**

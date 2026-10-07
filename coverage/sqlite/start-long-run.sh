@@ -79,6 +79,11 @@ case_count=$(grep -c -- '-- EGRAPH_CORPUS_CASE_BEGIN' "$egraph_input" || true)
 [ "$case_count" -gt 0 ] || { echo "Variant-ready EGRAPH input corpus has no cases: $egraph_input" >&2; exit 1; }
 
 
+# The freshest auto research, wherever finish-long-codecov.ps1 left it.
+auto_research_results=$(ls -t "$here"/*/auto-research-results.csv "$here"/*/auto-research/auto-research-results.csv \
+                        2>/dev/null | grep -v '/auto-research-smoke-' | head -1 || true)
+[ -n "$auto_research_results" ] || { echo "Missing auto-research results under $here" >&2; exit 1; }
+
 inputs=$egraph_input
 high_coverage=$here/high-coverage-egraph-corpus.sql
 if [ -f "$high_coverage" ]; then inputs+=":$high_coverage"; hc_status="included: $high_coverage"
@@ -111,12 +116,14 @@ java_args+=(
     "-Degraph.variantOnlyError.log=$run_dir/variant-only-errors.log"
     -Dsqlite3.egraph.corpus.selectOnlyTemplates=true
     -Dsqlite3.egraph.baseSkeletons=true
+    -Dsqlite3.egraph.autoResearchGuidedShapes=true
     "-Degraph.referee.command=$referee"
     "-Degraph.referee.log=$run_dir/referee.sql"
     "-Degraph.knownBugs.log=$run_dir/known-bugs.sql"
     "-Degraph.optMask.log=$run_dir/optmask-findings.log"
     "-Degraph.repro.dir=$run_dir/repro"
     "-Degraph.integrity.log=$run_dir/integrity-findings.log"
+    "-Dsqlite3.egraph.autoResearchResults=$auto_research_results"
     -cp "$jar"
     sqlancer.Main
     --num-threads=1
@@ -152,6 +159,7 @@ echo "System under test: $sut${referee:+, referee $referee}"
 echo "Official EGRAPH variant-ready cases: $case_count"
 echo "High-coverage corpus input: $hc_status"
 echo "Auto-research corpus input: $ar_status"
+echo "Auto-research results: $auto_research_results"
 if [ "$timeout" -gt 0 ]; then echo "SQLancer will stop after $timeout seconds ($((timeout / 3600)) h $((timeout % 3600 / 60)) min)."
 else echo "SQLancer will run without a time limit."; fi
 
