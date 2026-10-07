@@ -1,0 +1,11 @@
+# Rules removed as unsound (memory: egraph-unsound-rules-removed, 2026-09-27). The gate must fail every one.
+add-assoc-l ; (+ (+ ?x ?y) ?z) => (+ ?x (+ ?y ?z))
+add-assoc-r ; (+ ?x (+ ?y ?z)) => (+ (+ ?x ?y) ?z)
+mul-assoc-l ; (* (* ?x ?y) ?z) => (* ?x (* ?y ?z))
+mul-assoc-r ; (* ?x (* ?y ?z)) => (* (* ?x ?y) ?z)
+sub-to-add ; (- ?x ?y) => (+ ?x (neg ?y))
+add-neg-to-sub ; (+ ?x (neg ?y)) => (- ?x ?y)
+sub-antisym ; (- ?x ?y) => (neg (- ?y ?x))
+double-neg ; (not (not ?x)) => ?x
+# The swap rules without the server's collation guard: unsound for two columns of different collation.
+eq-sym-unguarded ; (= ?x ?y) => (= ?y ?x)
