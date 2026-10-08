@@ -53,7 +53,9 @@ EXTENSION = {"is": "({} IS {})", "isnot": "({} IS NOT {})", "uplus": "(+{})",
              "coalesce": "coalesce({}, {})", "ifnull": "ifnull({}, {})", "nullif": "nullif({}, {})",
              "cast_int": "CAST({} AS INTEGER)", "cast_real": "CAST({} AS REAL)",
              "cast_text": "CAST({} AS TEXT)", "cast_numeric": "CAST({} AS NUMERIC)",
-             "cast_blob": "CAST({} AS BLOB)"}
+             "cast_blob": "CAST({} AS BLOB)",
+             "in1": "({} IN ({}))", "in2": "({} IN ({}, {}))", "in3": "({} IN ({}, {}, {}))",
+             "like": "({} LIKE {})", "glob": "({} GLOB {})"}
 # Operators whose result is a value that can carry a collation onward, not a truth value.
 VALUE_OPS = {"+", "-", "*", "/", "rem", "concat", "bitand", "bitor", "neg", "bitnot", "uplus", "iif", "case",
              "case2", "casesimple",
@@ -127,8 +129,14 @@ def produces_value(tree):
     return isinstance(tree, str) or tree[0] in VALUE_OPS
 
 
+# Literals carrying an explicit COLLATE: a constant behaves unlike a column in places (SQLite turns
+# x IN (constant) into x = +constant, and the constant's COLLATE then decides), and the column with
+# an explicit COLLATE alone missed that - in2-dup-to-in1 passed against the IN bug of 2026-10-08.
+COLLATED_LITERALS = ["('ABC' COLLATE NOCASE)", "('a ' COLLATE RTRIM)", "(1 COLLATE NOCASE)"]
+
+
 def options():
-    return [("lit", lit) for lit in LITERALS] + [("col", c) for c in COLUMNS] + [("col", EXPLICIT)]
+    return [("lit", lit) for lit in LITERALS + COLLATED_LITERALS] + [("col", c) for c in COLUMNS] +         [("col", EXPLICIT)]
 
 
 def sample_bindings(n):
@@ -173,8 +181,11 @@ def check_rule_unguarded(rule):
     for choice in choices:
         cols = [c for c in choice if c[0] == "col"]
         if name in OPERAND_SWAPPING and len(vs) >= 2:
+            # The server withholds these when both operands mention a column, or both carry an
+            # explicit COLLATE (compares_columns_of_unknown_collation).
             a, b = choice[0], choice[1]
-            if a[0] == "col" and b[0] == "col":
+            explicit = lambda c: c == ("col", EXPLICIT) or (c[0] == "lit" and c[1] in COLLATED_LITERALS)
+            if (a[0] == "col" and b[0] == "col") or (explicit(a) and explicit(b)):
                 continue
         binding, frm, shown = {}, [], []
         for i, (var, (kind, val)) in enumerate(zip(vs, choice)):

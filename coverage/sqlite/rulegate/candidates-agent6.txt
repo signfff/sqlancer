@@ -1,0 +1,104 @@
+# Candidate rules for in1/in2/in3 and like/glob (agent1, round 6). Nothing here has been run yet: every rule should go through rulegate.
+# Facts and assumptions used throughout:
+#   - x IN (a,b,...) with 2+ elements: each element is compared to x using x's affinity (comparisonAffinity of the LHS only) and x's collation only.
+#     The element's own affinity and implicit collation are ignored. The result is 1 if any element matches; otherwise NULL if x or any element is NULL; otherwise 0.
+#   - RISK FOR in1 SPECIFICALLY: as I recall parse.y, x IN (a) with a single CONSTANT element is rewritten at parse time to x = +a. Unary + strips a's affinity,
+#     but I believe it does NOT strip an explicit COLLATE on a. So for x without collation, 'abc' IN ('ABC' COLLATE NOCASE) may give 1 (NOCASE)
+#     while 'abc' IN ('ABC' COLLATE NOCASE, 'ABC' COLLATE NOCASE) gives 0 (x's BINARY). Every rule that converts between in1 and in2/in3 is marked RISKY for this reason.
+#     If rulegate finds such a counterexample, it may be a real SQLite inconsistency worth a second look, not just an unsound rule.
+#   - LIKE/GLOB are functions. They apply no affinity and no collation, they convert operands with sqlite3_value_text (the same rendering as CAST AS TEXT), and they return 0/1/NULL.
+#     NULL comes out iff an operand is NULL. A too-long pattern raises an error, so rules that stop evaluating LIKE could lose that error; patterns that long are never generated, I assume.
+#   - Rules I checked and REJECT:
+#       (in1 (istrue ?y) ?a) => (= (istrue ?y) ?a): = applies a's TEXT affinity to the LHS, while IN uses the LHS's (none), so 1 vs a TEXT column holding '1' differs.
+#       (in1 ?x (cast_int ?y)) => (= ?x (cast_int ?y)): the CAST carries INTEGER affinity into =, so numeric affinity is applied to a TEXT-less x.
+#       (in2 (case ?c ?a ?b) ?d ?e) => (case ?c (in2 ?a ?d ?e) (in2 ?b ?d ?e)): the LHS affinity changes (CASE has none, but a column does).
+#       (in2 ?x (coalesce ?a ?b) ?d) => (coalesce (in2 ?x ?a ?d) (in2 ?x ?b ?d)): when d is NULL and x matches b, the in2 with a returns NULL, so it falls through wrongly.
+#       (glob ?x ?x) => (isnotnull ?x): '[' GLOB '[' is 0 (unterminated class), and '[a]' GLOB '[a]' is 0.
+#       (in1 ?x ?a) => (and (in1 ?x ?a) (isnotnull ?x)): a NULL x gives NULL vs 0.
+
+## IN: element order and duplicates (all elements are treated uniformly, so these are pure set laws)
+
+in2-perm ; (in2 ?x ?a ?b) => (in2 ?x ?b ?a)
+#   Every element is compared with x's affinity and collation, and the match/NULL outcome is symmetric in the elements.
+in3-swap12 ; (in3 ?x ?a ?b ?c) => (in3 ?x ?b ?a ?c)
+#   Same as in2-perm. Together with in3-rot it generates all orderings.
+in3-rot ; (in3 ?x ?a ?b ?c) => (in3 ?x ?b ?c ?a)
+#   Same as in2-perm.
+in3-dup-to-in2 ; (in3 ?x ?a ?a ?b) => (in2 ?x ?a ?b)
+#   A repeated element changes neither "some element matches" nor "some element is NULL". Both sides are multi-element IN, so the in1 risk does not apply. Sound in both directions.
+in2-to-in3-dup ; (in2 ?x ?a ?b) => (in3 ?x ?a ?b ?b)
+#   This is the reverse of in3-dup-to-in2. It forces a longer list, which may switch to the ephemeral-table IN code path when all elements are constant.
+in2-dup-to-in1 ; (in2 ?x ?a ?a) => (in1 ?x ?a)
+#   The set law holds.
+#   RISKY: if a is a constant with an explicit COLLATE and x has no collation, then in1 becomes x = +a, which may pick a's collation (see the header).
+in1-to-in2-dup ; (in1 ?x ?a) => (in2 ?x ?a ?a)
+#   This is the reverse of in2-dup-to-in1 and carries the same RISK. It is valuable precisely because it moves single-element IN off the "= +a" rewrite.
+
+## IN: splitting into or merging from OR
+
+in2-split ; (in2 ?x ?a ?b) => (or (in1 ?x ?a) (in1 ?x ?b))
+#   in1 gives 1 on a match, NULL if x or a is NULL, and 0 otherwise. The 3-valued OR then gives 1 if any element matches, else NULL if any part is NULL, else 0, which is exactly in2.
+#   RISKY: the in1 explicit-COLLATE caveat applies.
+in1-merge ; (or (in1 ?x ?a) (in1 ?x ?b)) => (in2 ?x ?a ?b)
+#   This is the reverse of in2-split and carries the same RISK.
+in3-split-tail ; (in3 ?x ?a ?b ?c) => (or (in2 ?x ?a ?b) (in1 ?x ?c))
+#   Same 3-valued argument as in2-split. RISKY only through in1.
+in3-split-head ; (in3 ?x ?a ?b ?c) => (or (in1 ?x ?a) (in2 ?x ?b ?c))
+#   Same argument. RISKY only through in1.
+
+## IN with a single element vs =, guard-free when the element is never TEXT
+
+in1-istrue-elem-to-eq ; (in1 ?x (istrue ?y)) => (= ?x (istrue ?y))
+#   The element is an integer 0/1 with no affinity.
+#   With = the comparison affinity comes from x alone (TEXT x turns 1 into '1', numeric x leaves it alone, no affinity leaves it alone), which is the same as IN.
+#   Collation is never consulted, because one side is an integer. The same rule works for isfalse/isnottrue/isnotfalse/isnull/isnotnull/is/isnot/not, comparison elements, and like/glob elements.
+in1-cmp-elem-to-eq ; (in1 ?x (= ?y ?z)) => (= ?x (= ?y ?z))
+#   The element is a 0/1/NULL integer with no affinity, so the argument is the same as in1-istrue-elem-to-eq. A NULL element gives NULL on both sides.
+#   SLIGHTLY UNSURE: this assumes an inner explicit COLLATE on y does not alter anything, since collation is irrelevant for integer vs anything. The same rule works for < <= > >= <>.
+in1-bitand-elem-to-eq ; (in1 ?x (bitand ?y ?z)) => (= ?x (bitand ?y ?z))
+#   & yields an integer or NULL, with no affinity. The same argument applies. The same rule works for bitor/bitnot.
+in1-self ; (in1 ?x ?x) => (= ?x ?x)
+#   Both forms compare x with itself under x's affinity and collation (the LHS is the same expression), so the values agree, including NULL giving NULL.
+
+## IN and NULL tests (results are 0/1)
+
+isnull-in1 ; (isnull (in1 ?x ?a)) => (or (isnull ?x) (isnull ?a))
+#   A single-element IN is NULL iff x or a is NULL. With both non-NULL it is a plain 0/1 comparison.
+isnull-in2 ; (isnull (in2 ?x ?a ?b)) => (and (isnottrue (in2 ?x ?a ?b)) (or (isnull ?x) (or (isnull ?a) (isnull ?b))))
+#   IN is NULL iff no element matched (so it is not true) and some operand is NULL. A match gives 0 on both sides. No match with no NULL gives 0 on both sides.
+isnotnull-in1 ; (isnotnull (in1 ?x ?a)) => (and (isnotnull ?x) (isnotnull ?a))
+#   This is the complement of isnull-in1. It may be derivable via not-isnull and De Morgan.
+
+## IN with CASE elements (multi-element only, to avoid the in1 rewrite)
+
+in2-case-elem ; (in2 ?x (case ?c ?a ?b) ?d) => (case ?c (in2 ?x ?a ?d) (in2 ?x ?b ?d))
+#   The element's own affinity and collation are ignored by multi-element IN, so the CASE wrapper makes no difference, and the selected value is the same. The results are 0/1/NULL integers.
+#   UNSURE: this assumes multi-element IN also ignores an EXPLICIT COLLATE inside an element. If it does not, this can fail when the CASE carries a collation that a and b do not.
+
+## LIKE / GLOB
+
+isnull-like ; (isnull (like ?x ?p)) => (or (isnull ?x) (isnull ?p))
+#   LIKE returns NULL iff either operand is NULL, and otherwise 0/1.
+isnull-glob ; (isnull (glob ?x ?p)) => (or (isnull ?x) (isnull ?p))
+#   Same as isnull-like.
+like-drop-cast-text-x ; (like (cast_text ?x) ?p) => (like ?x ?p)
+#   LIKE reads its operand through sqlite3_value_text, which uses the same stringification as CAST AS TEXT. A BLOB's bytes are read as text either way. No affinity or collation is involved.
+like-drop-cast-text-p ; (like ?x (cast_text ?p)) => (like ?x ?p)
+#   Same argument for the pattern.
+glob-drop-cast-text-x ; (glob (cast_text ?x) ?p) => (glob ?x ?p)
+#   Same argument as for LIKE.
+glob-drop-cast-text-p ; (glob ?x (cast_text ?p)) => (glob ?x ?p)
+#   Same argument as for LIKE.
+like-case-x ; (like (case ?c ?a ?b) ?p) => (case ?c (like ?a ?p) (like ?b ?p))
+#   LIKE sees only the selected value, so the absence of affinity on the CASE result does not matter. The result is a 0/1/NULL integer, so CASE collation is irrelevant. The same rule works for glob.
+like-case-p ; (like ?x (case ?c ?p ?q)) => (case ?c (like ?x ?p) (like ?x ?q))
+#   Same argument for the pattern. The same rule works for glob.
+like-coalesce-x ; (like (coalesce ?a ?b) ?p) => (coalesce (like ?a ?p) (like ?b ?p))
+#   If p is NULL, both sides are NULL. If a is non-NULL, like(a,p) is non-NULL and is chosen. If a is NULL, like(a,p) is NULL and it falls to like(b,p). The same rule works for glob.
+like-coalesce-p ; (like ?x (coalesce ?p ?q)) => (coalesce (like ?x ?p) (like ?x ?q))
+#   If x is NULL, both sides are NULL. If p is non-NULL, it is chosen. If p is NULL, it falls to q. The same rule works for glob.
+like-self ; (like ?x ?x) => (isnotnull ?x)
+#   Every literal character matches itself (LIKE folds case but identical bytes are identical), '_' matches any single character including '_', and '%' matches any run including '%'. So any non-NULL text matches itself as a pattern. Without ESCAPE there are no other special characters.
+#   UNSURE: this is worth rulegate's attention for invalid UTF-8 BLOBs, numbers rendered as text, and the patternCompare fast paths after '%'. (glob x x) is definitely unsound; see the header.
+not-not-like ; (not (not (like ?x ?p))) => (like ?x ?p)
+#   LIKE returns only 0/1/NULL, and NOT NOT is the identity on that set. The same rule works for glob and for in1/in2/in3.

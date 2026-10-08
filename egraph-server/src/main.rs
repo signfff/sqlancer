@@ -223,7 +223,12 @@ fn sqlite_binding(expr: &SqlExpr) -> Option<u8> {
             _ => return None,
         },
         SqlExpr::UnaryOp { op: UnaryOperator::Not, .. } => 3,
-        SqlExpr::UnaryOp { .. } | SqlExpr::Collate { .. } => 10,
+        // In parse.y a prefix -, + and ~ take BITNOT's precedence, above COLLATE: SQLite reads
+        // `-9223372036854775808 COLLATE NOCASE` as (-9223372036854775808) COLLATE NOCASE, the
+        // integer minimum, and sqlparser as -(9223372036854775808 COLLATE NOCASE), a REAL. Found by
+        // e2e.py with collated literals as leaves (2026-10-08).
+        SqlExpr::Collate { .. } => 10,
+        SqlExpr::UnaryOp { .. } => 11,
         SqlExpr::IsNull(_)
         | SqlExpr::IsNotNull(_)
         | SqlExpr::IsTrue(_)
@@ -357,6 +362,7 @@ mod tests {
             "SELECT * FROM t0 WHERE c0 | c1 & c2",
             "SELECT * FROM t0 WHERE c0 * c1 || c2 = 'x'",
             "SELECT * FROM t0 WHERE c0 <> c1 >= 2",
+            "SELECT * FROM t0 WHERE c2 = -9223372036854775808 COLLATE RTRIM",
         ];
         for sql in refused {
             assert!(!groups_like_sqlite(&parse_one(sql)), "{}", sql);

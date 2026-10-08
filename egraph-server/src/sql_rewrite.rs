@@ -65,6 +65,11 @@ pub enum SqlLang {
     CastText([Id; 1]),
     CastNumeric([Id; 1]),
     CastBlob([Id; 1]),
+    In1([Id; 2]),       // x IN (a)
+    In2([Id; 3]),       // x IN (a, b)
+    In3([Id; 4]),       // x IN (a, b, c); NOT IN is not(inN), longer lists stay atoms
+    Like([Id; 2]),      // x LIKE p, no ESCAPE
+    Glob([Id; 2]),      // x GLOB p
     Symbol(u64),
 }
 
@@ -106,6 +111,11 @@ impl Language for SqlLang {
             SqlLang::Case(c) => c,
             SqlLang::Coalesce(c) => c,
             SqlLang::Nullif(c) => c,
+            SqlLang::In1(c) => c,
+            SqlLang::In2(c) => c,
+            SqlLang::In3(c) => c,
+            SqlLang::Like(c) => c,
+            SqlLang::Glob(c) => c,
             SqlLang::CastInt(c) => c,
             SqlLang::CastReal(c) => c,
             SqlLang::CastText(c) => c,
@@ -148,6 +158,11 @@ impl Language for SqlLang {
             SqlLang::Case(c) => c,
             SqlLang::Coalesce(c) => c,
             SqlLang::Nullif(c) => c,
+            SqlLang::In1(c) => c,
+            SqlLang::In2(c) => c,
+            SqlLang::In3(c) => c,
+            SqlLang::Like(c) => c,
+            SqlLang::Glob(c) => c,
             SqlLang::CastInt(c) => c,
             SqlLang::CastReal(c) => c,
             SqlLang::CastText(c) => c,
@@ -373,6 +388,36 @@ impl FromOp for SqlLang {
                     .map_err(|_| format!("cast_blob: expected 1 child"))?;
                 Ok(SqlLang::CastBlob(arr))
             }
+            "in1" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("in1: expected 2 children"))?;
+                Ok(SqlLang::In1(arr))
+            }
+            "in2" => {
+                let arr: [Id; 3] = children
+                    .try_into()
+                    .map_err(|_| format!("in2: expected 3 children"))?;
+                Ok(SqlLang::In2(arr))
+            }
+            "in3" => {
+                let arr: [Id; 4] = children
+                    .try_into()
+                    .map_err(|_| format!("in3: expected 4 children"))?;
+                Ok(SqlLang::In3(arr))
+            }
+            "like" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("like: expected 2 children"))?;
+                Ok(SqlLang::Like(arr))
+            }
+            "glob" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("glob: expected 2 children"))?;
+                Ok(SqlLang::Glob(arr))
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -423,6 +468,11 @@ impl fmt::Display for SqlLang {
             SqlLang::Case(_) => write!(f, "case"),
             SqlLang::Coalesce(_) => write!(f, "coalesce"),
             SqlLang::Nullif(_) => write!(f, "nullif"),
+            SqlLang::In1(_) => write!(f, "in1"),
+            SqlLang::In2(_) => write!(f, "in2"),
+            SqlLang::In3(_) => write!(f, "in3"),
+            SqlLang::Like(_) => write!(f, "like"),
+            SqlLang::Glob(_) => write!(f, "glob"),
             SqlLang::CastInt(_) => write!(f, "cast_int"),
             SqlLang::CastReal(_) => write!(f, "cast_real"),
             SqlLang::CastText(_) => write!(f, "cast_text"),
@@ -702,6 +752,45 @@ fn sql_expr_to_recexpr_impl(
             }
         }
 
+        // x [NOT] IN (a[, b[, c]]). A row value on either side keeps the whole IN an atom: the
+        // rules would compare tuples element by element, which follows other NULL rules.
+        SqlExpr::InList { expr: x, list, negated }
+            if (1..=3).contains(&list.len())
+                && !contains_row_value(x)
+                && !list.iter().any(contains_row_value) =>
+        {
+            let mut ids = vec![sql_expr_to_recexpr_impl(x, rec, symbols, counter, dedup, source_sql)];
+            for item in list {
+                ids.push(sql_expr_to_recexpr_impl(item, rec, symbols, counter, dedup, source_sql));
+            }
+            let node = rec.add(match ids.len() {
+                2 => SqlLang::In1([ids[0], ids[1]]),
+                3 => SqlLang::In2([ids[0], ids[1], ids[2]]),
+                _ => SqlLang::In3([ids[0], ids[1], ids[2], ids[3]]),
+            });
+            if *negated {
+                rec.add(SqlLang::Not([node]))
+            } else {
+                node
+            }
+        }
+        // x [NOT] LIKE p and x [NOT] GLOB p (GLOB arrives as SIMILAR TO, see preprocessing), no ESCAPE.
+        SqlExpr::Like { negated, any: false, expr: x, pattern, escape_char: None }
+        | SqlExpr::SimilarTo { negated, expr: x, pattern, escape_char: None } => {
+            let a = sql_expr_to_recexpr_impl(x, rec, symbols, counter, dedup, source_sql);
+            let b = sql_expr_to_recexpr_impl(pattern, rec, symbols, counter, dedup, source_sql);
+            let node = rec.add(if matches!(expr, SqlExpr::Like { .. }) {
+                SqlLang::Like([a, b])
+            } else {
+                SqlLang::Glob([a, b])
+            });
+            if *negated {
+                rec.add(SqlLang::Not([node]))
+            } else {
+                node
+            }
+        }
+
         // CAST(x AS type): plain CAST only (not TRY_CAST or ::), no FORMAT.
         SqlExpr::Cast {
             kind: sqlparser::ast::CastKind::Cast,
@@ -870,6 +959,8 @@ fn compares_two_collations_here(expr: &SqlExpr) -> bool {
     };
     match expr {
         SqlExpr::BinaryOp { left, op, right } => is_collation_sensitive_operator(op) && two_sides(left, right),
+        // x IN (a, b) can be rewritten into x = a ..., which the swap rules would turn around.
+        SqlExpr::InList { expr: x, list, .. } => list.iter().any(|item| two_sides(x, item)),
         // CASE x WHEN v ... is read as x = v.
         SqlExpr::Case {
             operand: Some(x),
@@ -967,6 +1058,14 @@ fn cast_to(inner: SqlExpr, type_name: &str) -> SqlExpr {
         data_type: DataType::Custom(ObjectName::from(vec![Ident::new(type_name)]), Vec::new()),
         array: false,
         format: None,
+    }
+}
+
+fn in_list(expr: &RecExpr<SqlLang>, x: Id, items: &[Id], symbols: &SymbolTable) -> SqlExpr {
+    SqlExpr::InList {
+        expr: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, x, symbols))),
+        list: items.iter().map(|i| recexpr_to_sql_expr_impl(expr, *i, symbols)).collect(),
+        negated: false,
     }
 }
 
@@ -1185,6 +1284,23 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
         SqlLang::CastText([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "TEXT"),
         SqlLang::CastNumeric([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "NUMERIC"),
         SqlLang::CastBlob([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "BLOB"),
+        SqlLang::In1([x, a]) => in_list(expr, *x, &[*a], symbols),
+        SqlLang::In2([x, a, b]) => in_list(expr, *x, &[*a, *b], symbols),
+        SqlLang::In3([x, a, b, c]) => in_list(expr, *x, &[*a, *b, *c], symbols),
+        SqlLang::Like([x, p]) => SqlExpr::Like {
+            negated: false,
+            any: false,
+            expr: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *x, symbols))),
+            pattern: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *p, symbols))),
+            escape_char: None,
+        },
+        // Printed as SIMILAR TO, which restore_glob turns back into GLOB on the way out.
+        SqlLang::Glob([x, p]) => SqlExpr::SimilarTo {
+            negated: false,
+            expr: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *x, symbols))),
+            pattern: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *p, symbols))),
+            escape_char: None,
+        },
         SqlLang::Coalesce([a, b]) => call("coalesce", vec![
             recexpr_to_sql_expr_impl(expr, *a, symbols),
             recexpr_to_sql_expr_impl(expr, *b, symbols),
@@ -1677,22 +1793,42 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("isnull-via-is-reflexive"; "(isnull ?x)" => "(is (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnotnull-via-isnot-reflexive"; "(isnotnull ?x)" => "(isnot (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnot-sym"; "(isnot ?x ?y)" => "(isnot ?y ?x)"),
+        //  IN lists and LIKE / GLOB (agent round 6). Left out: like-self (NULL LIKE NULL is NULL),
+        //  and every rule turning a one-element IN into a longer list or back. SQLite reads
+        //  x IN (constant) as x = +constant, so an explicit COLLATE on the constant decides it, while
+        //  a longer list uses x's collation only (datatype3 7.1); those rules fail on that alone.
+        rewrite!("in2-perm"; "(in2 ?x ?a ?b)" => "(in2 ?x ?b ?a)"),
+        rewrite!("in3-swap12"; "(in3 ?x ?a ?b ?c)" => "(in3 ?x ?b ?a ?c)"),
+        rewrite!("in3-rot"; "(in3 ?x ?a ?b ?c)" => "(in3 ?x ?b ?c ?a)"),
+        rewrite!("in3-dup-to-in2"; "(in3 ?x ?a ?a ?b)" => "(in2 ?x ?a ?b)"),
+        rewrite!("in2-to-in3-dup"; "(in2 ?x ?a ?b)" => "(in3 ?x ?a ?b ?b)"),
+        rewrite!("in1-istrue-elem-to-eq"; "(in1 ?x (istrue ?y))" => "(= ?x (istrue ?y))"),
+        rewrite!("in1-cmp-elem-to-eq"; "(in1 ?x (= ?y ?z))" => "(= ?x (= ?y ?z))"),
+        rewrite!("in1-bitand-elem-to-eq"; "(in1 ?x (bitand ?y ?z))" => "(= ?x (bitand ?y ?z))"),
+        rewrite!("in1-self"; "(in1 ?x ?x)" => "(= ?x ?x)"),
+        rewrite!("isnull-in1"; "(isnull (in1 ?x ?a))" => "(or (isnull ?x) (isnull ?a))"),
+        rewrite!("isnull-in2"; "(isnull (in2 ?x ?a ?b))" => "(and (isnottrue (in2 ?x ?a ?b)) (or (isnull ?x) (or (isnull ?a) (isnull ?b))))"),
+        rewrite!("isnotnull-in1"; "(isnotnull (in1 ?x ?a))" => "(and (isnotnull ?x) (isnotnull ?a))"),
+        rewrite!("in2-case-elem"; "(in2 ?x (case ?c ?a ?b) ?d)" => "(case ?c (in2 ?x ?a ?d) (in2 ?x ?b ?d))"),
+        rewrite!("isnull-like"; "(isnull (like ?x ?p))" => "(or (isnull ?x) (isnull ?p))"),
+        rewrite!("isnull-glob"; "(isnull (glob ?x ?p))" => "(or (isnull ?x) (isnull ?p))"),
+        rewrite!("like-drop-cast-text-x"; "(like (cast_text ?x) ?p)" => "(like ?x ?p)"),
+        rewrite!("like-drop-cast-text-p"; "(like ?x (cast_text ?p))" => "(like ?x ?p)"),
+        rewrite!("glob-drop-cast-text-x"; "(glob (cast_text ?x) ?p)" => "(glob ?x ?p)"),
+        rewrite!("glob-drop-cast-text-p"; "(glob ?x (cast_text ?p))" => "(glob ?x ?p)"),
+        rewrite!("like-case-x"; "(like (case ?c ?a ?b) ?p)" => "(case ?c (like ?a ?p) (like ?b ?p))"),
+        rewrite!("like-case-p"; "(like ?x (case ?c ?p ?q))" => "(case ?c (like ?x ?p) (like ?x ?q))"),
+        rewrite!("like-coalesce-x"; "(like (coalesce ?a ?b) ?p)" => "(coalesce (like ?a ?p) (like ?b ?p))"),
+        rewrite!("like-coalesce-p"; "(like ?x (coalesce ?p ?q))" => "(coalesce (like ?x ?p) (like ?x ?q))"),
+        rewrite!("not-not-like"; "(not (not (like ?x ?p)))" => "(like ?x ?p)"),
         //  CASE (the case node; agent round 3). case-and-nest, case-same-cond-then and -else failed: they move or drop a sub-expression whose explicit COLLATE decides the collation of the CASE result.
         rewrite!("case-istrue-cond"; "(case ?c ?a ?b)" => "(case (istrue ?c) ?a ?b)"),
         rewrite!("case-not-cond-to-isfalse"; "(case (not ?c) ?a ?b)" => "(case (isfalse ?c) ?a ?b)"),
-        rewrite!("case-isnull-swap"; "(case (isnull ?x) ?a ?b)" => "(case (isnotnull ?x) ?b ?a)"),
-        rewrite!("case-is-swap"; "(case (is ?x ?y) ?a ?b)" => "(case (isnot ?x ?y) ?b ?a)"),
-        rewrite!("case-istrue-swap"; "(case (istrue ?c) ?a ?b)" => "(case (isnottrue ?c) ?b ?a)"),
-        rewrite!("case-isfalse-swap"; "(case (isfalse ?c) ?a ?b)" => "(case (isnotfalse ?c) ?b ?a)"),
-        rewrite!("case-or-nest"; "(case (or ?c ?d) ?a ?b)" => "(case ?c ?a (case ?d ?a ?b))"),
-        rewrite!("case-cond-case"; "(case (case ?c ?d ?e) ?a ?b)" => "(case ?c (case ?d ?a ?b) (case ?e ?a ?b))"),
         rewrite!("not-into-case"; "(not (case ?c ?a ?b))" => "(case ?c (not ?a) (not ?b))"),
         rewrite!("isnull-into-case"; "(isnull (case ?c ?a ?b))" => "(case ?c (isnull ?a) (isnull ?b))"),
         rewrite!("istrue-into-case"; "(istrue (case ?c ?a ?b))" => "(case ?c (istrue ?a) (istrue ?b))"),
         rewrite!("neg-into-case"; "(neg (case ?c ?a ?b))" => "(case ?c (neg ?a) (neg ?b))"),
         rewrite!("bitnot-into-case"; "(bitnot (case ?c ?a ?b))" => "(case ?c (bitnot ?a) (bitnot ?b))"),
-        rewrite!("add-into-case"; "(+ (case ?c ?a ?b) ?d)" => "(case ?c (+ ?a ?d) (+ ?b ?d))"),
-        rewrite!("concat-into-case"; "(concat (case ?c ?a ?b) ?d)" => "(case ?c (concat ?a ?d) (concat ?b ?d))"),
         rewrite!("and-into-case"; "(and (case ?c ?a ?b) ?d)" => "(case ?c (and ?a ?d) (and ?b ?d))"),
         rewrite!("or-into-case"; "(or (case ?c ?a ?b) ?d)" => "(case ?c (or ?a ?d) (or ?b ?d))"),
         rewrite!("istrue-to-case"; "(istrue ?x)" => "(case ?x (isnotnull ?x) (isnull (isnull ?x)))"),
@@ -1701,6 +1837,11 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("and-to-case"; "(and ?x ?y)" => "(case ?x (not (not ?y)) (and ?x ?y))"),
         rewrite!("or-to-case"; "(or ?x ?y)" => "(case ?x (isnotnull ?x) (or ?x ?y))"),
         rewrite!("case-bool-to-andor"; "(case ?c (not ?a) (not ?b))" => "(or (and (istrue ?c) (not ?a)) (and (isnottrue ?c) (not ?b)))"),
+        //  Removed after rulegate.py gained literals with an explicit COLLATE (2026-10-08):
+        //  case-isnull-swap, case-is-swap, case-istrue-swap, case-isfalse-swap, case-or-nest,
+        //  case-cond-case, add-into-case, concat-into-case. With two branches carrying different
+        //  explicit collations, the first one met decides the collation of the CASE result, and
+        //  these rules change which one that is.
         //  coalesce / nullif (agent round 4).
         rewrite!("coalesce-assoc"; "(coalesce (coalesce ?a ?b) ?c)" => "(coalesce ?a (coalesce ?b ?c))"),
         rewrite!("coalesce-to-case"; "(coalesce ?a ?b)" => "(case (isnotnull ?a) ?a ?b)"),
@@ -1714,19 +1855,18 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("bitnot-into-coalesce"; "(bitnot (coalesce ?a ?b))" => "(coalesce (bitnot ?a) (bitnot ?b))"),
         rewrite!("bitand-into-coalesce"; "(bitand (coalesce ?a ?b) ?c)" => "(coalesce (bitand ?a ?c) (bitand ?b ?c))"),
         rewrite!("bitor-into-coalesce"; "(bitor (coalesce ?a ?b) ?c)" => "(coalesce (bitor ?a ?c) (bitor ?b ?c))"),
-        rewrite!("concat-into-coalesce"; "(concat (coalesce ?a ?b) ?c)" => "(coalesce (concat ?a ?c) (concat ?b ?c))"),
         rewrite!("coalesce-dup-inner"; "(coalesce ?a (coalesce ?a ?b))" => "(coalesce ?a ?b)"),
         rewrite!("coalesce-absorb-tail"; "(coalesce (coalesce ?a ?b) ?a)" => "(coalesce ?a ?b)"),
         rewrite!("coalesce-dead-fallback-isnull"; "(coalesce (isnull ?a) ?b)" => "(isnull ?a)"),
         rewrite!("coalesce-dead-fallback-istrue"; "(coalesce (istrue ?a) ?b)" => "(istrue ?a)"),
         rewrite!("coalesce-dead-fallback-is"; "(coalesce (is ?x ?y) ?b)" => "(is ?x ?y)"),
         rewrite!("case-coalesce-cond"; "(case (coalesce ?c ?d) ?x ?y)" => "(case (or (istrue ?c) (and (isnull ?c) (istrue ?d))) ?x ?y)"),
-        rewrite!("coalesce-into-case"; "(coalesce (case ?c ?a ?b) ?d)" => "(case ?c (coalesce ?a ?d) (coalesce ?b ?d))"),
         rewrite!("not-coalesce-self"; "(not (coalesce ?a ?a))" => "(not ?a)"),
         rewrite!("coalesce-nullif-reorder"; "(coalesce (nullif ?a ?b) ?a)" => "(coalesce ?a (nullif ?a ?b))"),
         rewrite!("istrue-nullif"; "(istrue (nullif ?a ?b))" => "(and (istrue ?a) (isnotnull (nullif ?a ?b)))"),
         rewrite!("isfalse-nullif"; "(isfalse (nullif ?a ?b))" => "(and (isfalse ?a) (isnotnull (nullif ?a ?b)))"),
         rewrite!("not-nullif-guard"; "(not (nullif ?a ?b))" => "(case (isnull (nullif ?a ?b)) (nullif ?a ?b) (not ?a))"),
+        //  Removed the same way: concat-into-coalesce, coalesce-into-case.
         //  CAST (agent round 5). The three *-sym-cast-* swaps are reached by the guarded swap rules when those are allowed; they are kept for the queries the guard withholds them from, which is sound because both sides are numbers after the cast.
         rewrite!("cast-real-idem"; "(cast_real (cast_real ?x))" => "(cast_real ?x)"),
         rewrite!("cast-text-idem"; "(cast_text (cast_text ?x))" => "(cast_text ?x)"),
@@ -1942,6 +2082,11 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::Case(_) => SqlLang::Case([child_ids[0], child_ids[1], child_ids[2]]),
         SqlLang::Coalesce(_) => SqlLang::Coalesce([child_ids[0], child_ids[1]]),
         SqlLang::Nullif(_) => SqlLang::Nullif([child_ids[0], child_ids[1]]),
+        SqlLang::In1(_) => SqlLang::In1([child_ids[0], child_ids[1]]),
+        SqlLang::In2(_) => SqlLang::In2([child_ids[0], child_ids[1], child_ids[2]]),
+        SqlLang::In3(_) => SqlLang::In3([child_ids[0], child_ids[1], child_ids[2], child_ids[3]]),
+        SqlLang::Like(_) => SqlLang::Like([child_ids[0], child_ids[1]]),
+        SqlLang::Glob(_) => SqlLang::Glob([child_ids[0], child_ids[1]]),
         SqlLang::CastInt(_) => SqlLang::CastInt([child_ids[0]]),
         SqlLang::CastReal(_) => SqlLang::CastReal([child_ids[0]]),
         SqlLang::CastText(_) => SqlLang::CastText([child_ids[0]]),
@@ -2083,6 +2228,21 @@ fn eval(
             SqlValue::Blob(b) => SqlValue::Blob(b),
             v => SqlValue::Blob(sqlvalue_to_text(&v).into_bytes()),
         },
+        // x IN (list): 1 on a match, else NULL when x or an item is NULL, else 0.
+        SqlLang::In1([x, a]) => eval_in(expr, *x, &[*a], symbols, assignment),
+        SqlLang::In2([x, a, b]) => eval_in(expr, *x, &[*a, *b], symbols, assignment),
+        SqlLang::In3([x, a, b, c]) => eval_in(expr, *x, &[*a, *b, *c], symbols, assignment),
+        // Approximate patterns (% _ for LIKE, * ? for GLOB, no character classes); only a backup.
+        SqlLang::Like([x, p]) | SqlLang::Glob([x, p]) => {
+            let xv = eval(expr, *x, symbols, assignment);
+            let pv = eval(expr, *p, symbols, assignment);
+            if matches!(xv, SqlValue::Null) || matches!(pv, SqlValue::Null) {
+                SqlValue::Null
+            } else {
+                let like = matches!(&expr[root], SqlLang::Like(_));
+                SqlValue::Bool(pattern_match(&sqlvalue_to_text(&pv), &sqlvalue_to_text(&xv), like))
+            }
+        }
         SqlLang::Coalesce([a, b]) => match eval(expr, *a, symbols, assignment) {
             SqlValue::Null => eval(expr, *b, symbols, assignment),
             v => v,
@@ -2436,6 +2596,45 @@ fn sqlvalue_to_int(v: &SqlValue) -> Option<i64> {
 
 /// Resolve a Symbol: prefer literal value from the symbol table, fall back to
 /// the random assignment.
+fn eval_in(
+    expr: &RecExpr<SqlLang>,
+    x: Id,
+    items: &[Id],
+    symbols: &SymbolTable,
+    assignment: &HashMap<u64, SqlValue>,
+) -> SqlValue {
+    let xv = eval(expr, x, symbols, assignment);
+    let mut saw_null = matches!(xv, SqlValue::Null);
+    for item in items {
+        let iv = eval(expr, *item, symbols, assignment);
+        match xv.partial_cmp(&iv) {
+            Some(std::cmp::Ordering::Equal) => return SqlValue::Bool(true),
+            None => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        SqlValue::Null
+    } else {
+        SqlValue::Bool(false)
+    }
+}
+
+fn pattern_match(pattern: &str, text: &str, like: bool) -> bool {
+    let (many, one) = if like { ('%', '_') } else { ('*', '?') };
+    let fold = |c: char| if like { c.to_ascii_lowercase() } else { c };
+    let p: Vec<char> = pattern.chars().map(fold).collect();
+    let t: Vec<char> = text.chars().map(fold).collect();
+    fn go(p: &[char], t: &[char], many: char, one: char) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some(&c) if c == many => (0..=t.len()).any(|i| go(&p[1..], &t[i..], many, one)),
+            Some(&c) => !t.is_empty() && (c == one || c == t[0]) && go(&p[1..], &t[1..], many, one),
+        }
+    }
+    go(&p, &t, many, one)
+}
+
 fn eval_symbol(key: u64, symbols: &SymbolTable, assignment: &HashMap<u64, SqlValue>) -> SqlValue {
     if let Some(sql_expr) = symbols.get(&key) {
         match sql_expr {

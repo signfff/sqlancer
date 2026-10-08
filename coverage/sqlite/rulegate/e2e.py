@@ -31,7 +31,12 @@ class Gen:
         self.features = features
 
     def leaf(self):
-        return "t0." + self.r.choice(COLUMNS) if self.r.random() < 0.6 else self.r.choice(VALUES)
+        if self.r.random() < 0.6:
+            return "t0." + self.r.choice(COLUMNS)
+        # Now and then a literal with an explicit COLLATE: constants and columns differ there.
+        if self.r.random() < 0.1:
+            return "(%s COLLATE %s)" % (self.r.choice(VALUES), self.r.choice(["NOCASE", "RTRIM", "BINARY"]))
+        return self.r.choice(VALUES)
 
     def value(self, d):
         if d <= 0 or self.r.random() < 0.4:
