@@ -1921,6 +1921,38 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("isnull-via-is-reflexive"; "(isnull ?x)" => "(is (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnotnull-via-isnot-reflexive"; "(isnotnull ?x)" => "(isnot (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnot-sym"; "(isnot ?x ?y)" => "(isnot ?y ?x)"),
+        //  Cross-node sweep (agent round 9): 42 proposed, all pass rulegate.py; 15 left out
+        //  because the rules above already reach them. The seven swap-*-left/right rules turn a
+        //  comparison around when one side is a value expression (no affinity, no implicit
+        //  collation, and no explicit COLLATE under the guard), so they hold where the guarded
+        //  swaps are withheld.
+        rewrite!("lt-and-ne"; "(and (< ?x ?y) (<> ?x ?y))" => "(< ?x ?y)"),
+        rewrite!("eq-and-le"; "(and (= ?x ?y) (<= ?x ?y))" => "(= ?x ?y)"),
+        rewrite!("between-and-lower"; "(and (between ?x ?lo ?hi) (>= ?x ?lo))" => "(between ?x ?lo ?hi)"),
+        rewrite!("absorb-or-lt"; "(or (< ?x ?y) (and (< ?x ?y) ?q))" => "(< ?x ?y)"),
+        rewrite!("absorb-and-lt"; "(and (< ?x ?y) (or (< ?x ?y) ?q))" => "(< ?x ?y)"),
+        rewrite!("absorb-or-is"; "(or (is ?x ?y) (and (is ?x ?y) ?q))" => "(is ?x ?y)"),
+        rewrite!("and-istrue-case"; "(and (istrue ?c) (case ?c ?a ?b))" => "(and (istrue ?c) ?a)"),
+        rewrite!("and-isnottrue-case"; "(and (isnottrue ?c) (case ?c ?a ?b))" => "(and (isnottrue ?c) ?b)"),
+        rewrite!("istrue-case-same"; "(istrue (case ?c ?a ?a))" => "(istrue ?a)"),
+        rewrite!("case-and-nest-reproposal"; "(case (and ?c ?d) ?a ?b)" => "(case ?c (case ?d ?a ?b) ?b)"),
+        rewrite!("case-same-cond-then-reproposal"; "(case ?c (case ?c ?a ?b) ?d)" => "(case ?c ?a ?d)"),
+        rewrite!("case-same-cond-else-reproposal"; "(case ?c ?a (case ?c ?b ?d))" => "(case ?c ?a ?d)"),
+        rewrite!("swap-eq-fn-left"; "(= (fn:lower ?x) ?y)" => "(= ?y (fn:lower ?x))"),
+        rewrite!("swap-lt-add-left"; "(< (+ ?a ?b) ?y)" => "(> ?y (+ ?a ?b))"),
+        rewrite!("swap-eq-concat-left"; "(= (concat ?a ?b) ?y)" => "(= ?y (concat ?a ?b))"),
+        rewrite!("swap-eq-coalesce-left"; "(= (coalesce ?a ?b) ?y)" => "(= ?y (coalesce ?a ?b))"),
+        rewrite!("swap-lt-case-left"; "(< (case ?c ?a ?b) ?y)" => "(> ?y (case ?c ?a ?b))"),
+        rewrite!("swap-eq-fn-right"; "(= ?y (fn:lower ?x))" => "(= (fn:lower ?x) ?y)"),
+        rewrite!("swap-is-fn-left"; "(is (fn:upper ?x) ?y)" => "(is ?y (fn:upper ?x))"),
+        rewrite!("like-drop-lower-x"; "(like (fn:lower ?x) ?p)" => "(like ?x ?p)"),
+        rewrite!("like-drop-upper-p"; "(like ?x (fn:upper ?p))" => "(like ?x ?p)"),
+        rewrite!("lower-drop-cast-text"; "(fn:lower (cast_text ?x))" => "(fn:lower ?x)"),
+        rewrite!("istrue-neg"; "(istrue (neg ?x))" => "(istrue ?x)"),
+        rewrite!("is-to-coalesce-eq"; "(is ?x ?y)" => "(coalesce (= ?x ?y) (and (isnull ?x) (isnull ?y)))"),
+        rewrite!("coalesce-nullif-self"; "(coalesce (nullif ?x ?x) ?y)" => "(coalesce ?y ?y)"),
+        rewrite!("in2-or-merge"; "(or (in2 ?x ?a ?b) (in2 ?x ?c ?c))" => "(in3 ?x ?a ?b ?c)"),
+        rewrite!("in3-split-in2"; "(in3 ?x ?a ?b ?c)" => "(or (in2 ?x ?a ?b) (in2 ?x ?c ?c))"),
         //  Restored: the ten CASE/coalesce rules removed earlier today fail only where an explicit
         //  COLLATE sits inside a CASE or coalesce, which explicit_collation_under_a_value now keeps
         //  away from every rule. They pass rulegate.py with that guard modelled.
