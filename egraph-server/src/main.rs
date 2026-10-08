@@ -97,6 +97,28 @@ fn preprocess_unquoted_sql(input: &str) -> String {
     let s = RE_ISNULL.replace_all(input, "$1 IS NULL").to_string();
     let s = RE_NOTNULL.replace_all(&s, "$1 IS NOT NULL").to_string();
 
+    // SQLite's `x IS y` and `x IS NOT y` compare any two expressions; sqlparser only knows IS
+    // [NOT] NULL/TRUE/FALSE/DISTINCT FROM and refused the rest, so each such check got no variants.
+    // IS [NOT] DISTINCT FROM is the same comparison in both, and SQLite has accepted that spelling
+    // since 3.39. (The regex crate has no lookahead, so the next token is captured and judged.)
+    static RE_IS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)\bIS(\s+NOT)?\s+(\w+|[^\w\s])"#).unwrap());
+    let s = RE_IS
+        .replace_all(&s, |c: &regex::Captures| {
+            let next = c[2].to_ascii_uppercase();
+            let negated = c.get(1).is_some();
+            let keeps = matches!(next.as_str(), "NULL" | "TRUE" | "FALSE" | "DISTINCT")
+                || (!negated && next == "NOT");
+            if keeps {
+                c[0].to_string()
+            } else if negated {
+                format!("IS DISTINCT FROM {}", &c[2])
+            } else {
+                format!("IS NOT DISTINCT FROM {}", &c[2])
+            }
+        })
+        .to_string();
+
     static RE_0X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\b0X([0-9a-fA-F]+)"#).unwrap());
     let s = RE_0X.replace_all(&s, "0x$1").to_string();
 

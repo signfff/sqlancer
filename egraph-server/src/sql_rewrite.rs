@@ -53,6 +53,8 @@ pub enum SqlLang {
     BitAnd([Id; 2]),    // & bitwise AND
     BitOr([Id; 2]),     // | bitwise OR
     Remainder([Id; 2]), // % modulo
+    Is([Id; 2]),        // x IS y (IS NOT DISTINCT FROM): equality where NULL equals NULL
+    IsNot([Id; 2]),     // x IS NOT y (IS DISTINCT FROM)
     Symbol(u64),
 }
 
@@ -89,6 +91,8 @@ impl Language for SqlLang {
             SqlLang::BitAnd(c) => c,
             SqlLang::BitOr(c) => c,
             SqlLang::Remainder(c) => c,
+            SqlLang::Is(c) => c,
+            SqlLang::IsNot(c) => c,
             SqlLang::Symbol(_) => &[],
         }
     }
@@ -121,6 +125,8 @@ impl Language for SqlLang {
             SqlLang::BitAnd(c) => c,
             SqlLang::BitOr(c) => c,
             SqlLang::Remainder(c) => c,
+            SqlLang::Is(c) => c,
+            SqlLang::IsNot(c) => c,
             SqlLang::Symbol(_) => &mut [],
         }
     }
@@ -281,6 +287,18 @@ impl FromOp for SqlLang {
                     .map_err(|_| format!("bitor: expected 2 children"))?;
                 Ok(SqlLang::BitOr(arr))
             }
+            "is" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("is: expected 2 children"))?;
+                Ok(SqlLang::Is(arr))
+            }
+            "isnot" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("isnot: expected 2 children"))?;
+                Ok(SqlLang::IsNot(arr))
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -326,6 +344,8 @@ impl fmt::Display for SqlLang {
             SqlLang::BitAnd(_) => write!(f, "bitand"),
             SqlLang::BitOr(_) => write!(f, "bitor"),
             SqlLang::Remainder(_) => write!(f, "rem"),
+            SqlLang::Is(_) => write!(f, "is"),
+            SqlLang::IsNot(_) => write!(f, "isnot"),
             SqlLang::Symbol(k) => write!(f, "{}", k),
         }
     }
@@ -560,6 +580,19 @@ fn sql_expr_to_recexpr_impl(
             rec.add(SqlLang::IsNotTrue([child]))
         }
 
+        // SQLite's `x IS y` / `x IS NOT y`, which preprocessing spells IS [NOT] DISTINCT FROM for
+        // sqlparser.
+        SqlExpr::IsNotDistinctFrom(left, right) => {
+            let l = sql_expr_to_recexpr_impl(left, rec, symbols, counter, dedup, source_sql);
+            let r = sql_expr_to_recexpr_impl(right, rec, symbols, counter, dedup, source_sql);
+            rec.add(SqlLang::Is([l, r]))
+        }
+        SqlExpr::IsDistinctFrom(left, right) => {
+            let l = sql_expr_to_recexpr_impl(left, rec, symbols, counter, dedup, source_sql);
+            let r = sql_expr_to_recexpr_impl(right, rec, symbols, counter, dedup, source_sql);
+            rec.add(SqlLang::IsNot([l, r]))
+        }
+
         SqlExpr::Nested(inner) => {
             // Parentheses are transparent
             sql_expr_to_recexpr_impl(inner, rec, symbols, counter, dedup, source_sql)
@@ -599,6 +632,10 @@ pub fn contains_row_value(expr: &SqlExpr) -> bool {
             high,
             ..
         } => contains_row_value(inner) || contains_row_value(low) || contains_row_value(high),
+        // `(a, b) IS (c, d)` compares row values, and the IS rules write each side twice.
+        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
+            contains_row_value(left) || contains_row_value(right)
+        }
         SqlExpr::IsNull(inner)
         | SqlExpr::IsNotNull(inner)
         | SqlExpr::IsTrue(inner)
@@ -674,6 +711,14 @@ pub fn compares_columns_of_unknown_collation(expr: &SqlExpr) -> bool {
         | SqlExpr::IsNotFalse(inner)
         | SqlExpr::IsUnknown(inner)
         | SqlExpr::IsNotUnknown(inner) => compares_columns_of_unknown_collation(inner),
+        // IS picks its collation the way = does.
+        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
+            ((mentions_a_column(left) && mentions_a_column(right))
+                || (carries_explicit_collation(left) && carries_explicit_collation(right)))
+                && left.to_string() != right.to_string()
+                || compares_columns_of_unknown_collation(left)
+                || compares_columns_of_unknown_collation(right)
+        }
         _ => false,
     }
 }
@@ -726,6 +771,7 @@ const OPERAND_SWAPPING_RULES: &[&str] = &[
     "lt-to-gt",
     "gteq-to-lteq",
     "lteq-to-gteq",
+    "is-sym",
 ];
 
 //  RecExpr<SqlLang> ?sqlparser Expr
@@ -880,6 +926,16 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
         SqlLang::IsNotTrue([c]) => SqlExpr::IsNotTrue(Box::new(wrap_compound(
             recexpr_to_sql_expr_impl(expr, *c, symbols),
         ))),
+        // Printed as IS [NOT] DISTINCT FROM, which SQLite has accepted since 3.39 with the same
+        // meaning as IS [NOT].
+        SqlLang::Is([l, r]) => SqlExpr::IsNotDistinctFrom(
+            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
+            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
+        ),
+        SqlLang::IsNot([l, r]) => SqlExpr::IsDistinctFrom(
+            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
+            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
+        ),
     }
 }
 
@@ -1297,6 +1353,35 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         // rewrite!("bitnot-double"; "(bitnot (bitnot ?x))" => "?x"),
         rewrite!("bitnot-demorgan-and"; "(bitnot (bitand ?x ?y))" => "(bitor (bitnot ?x) (bitnot ?y))"),
         rewrite!("bitnot-demorgan-or";  "(bitnot (bitor ?x ?y))" => "(bitand (bitnot ?x) (bitnot ?y))"),
+        //  Agent-proposed rules (2026-10-08). Each one passed coverage/sqlite/rulegate:
+        //  rulegate.py (both sides equal in SQLite for every binding to literals and columns of
+        //  every affinity and collation, value and comparison contexts), --novelty (not reachable
+        //  from its lhs by the rules above) and e2e.py (whole server path, variants vs original).
+        rewrite!("istrue-to-and-notnull"; "(istrue ?x)" => "(and ?x (isnotnull ?x))"),
+        rewrite!("isfalse-to-and-notnull"; "(isfalse ?x)" => "(and (not ?x) (isnotnull ?x))"),
+        rewrite!("isnottrue-to-or-null"; "(isnottrue ?x)" => "(or (not ?x) (isnull ?x))"),
+        rewrite!("isnotfalse-to-or-null"; "(isnotfalse ?x)" => "(or ?x (isnull ?x))"),
+        rewrite!("isfalse-to-istrue-not"; "(isfalse ?x)" => "(istrue (not ?x))"),
+        rewrite!("istrue-to-isfalse-not"; "(istrue ?x)" => "(isfalse (not ?x))"),
+        rewrite!("not-istrue"; "(not (istrue ?x))" => "(isnottrue ?x)"),
+        rewrite!("not-isfalse"; "(not (isfalse ?x))" => "(isnotfalse ?x)"),
+        rewrite!("istrue-and-dist"; "(istrue (and ?x ?y))" => "(and (istrue ?x) (istrue ?y))"),
+        rewrite!("istrue-or-dist"; "(istrue (or ?x ?y))" => "(or (istrue ?x) (istrue ?y))"),
+        rewrite!("isfalse-and-dist"; "(isfalse (and ?x ?y))" => "(or (isfalse ?x) (isfalse ?y))"),
+        rewrite!("isfalse-or-dist"; "(isfalse (or ?x ?y))" => "(and (isfalse ?x) (isfalse ?y))"),
+        rewrite!("triple-not"; "(not (not (not ?x)))" => "(not ?x)"),
+        rewrite!("not-not-and"; "(not (not (and ?x ?y)))" => "(and ?x ?y)"),
+        rewrite!("not-not-or"; "(not (not (or ?x ?y)))" => "(or ?x ?y)"),
+        rewrite!("isnull-not"; "(isnull (not ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-concat"; "(isnull (concat ?x ?y))" => "(or (isnull ?x) (isnull ?y))"),
+        rewrite!("isnull-bitand"; "(isnull (bitand ?x ?y))" => "(or (isnull ?x) (isnull ?y))"),
+        rewrite!("isnull-lt"; "(isnull (< ?x ?y))" => "(or (isnull ?x) (isnull ?y))"),
+        rewrite!("isnull-neg"; "(isnull (neg ?x))" => "(isnull ?x)"),
+        //  IS / IS NOT (the is and isnot nodes). is-sym turns the comparison around and is
+        //  withheld with the other swaps (OPERAND_SWAPPING_RULES).
+        rewrite!("is-expand"; "(is ?x ?y)" => "(or (and (isnull ?x) (isnull ?y)) (and (and (isnotnull ?x) (isnotnull ?y)) (= ?x ?y)))"),
+        rewrite!("isnot-to-not-is"; "(isnot ?x ?y)" => "(not (is ?x ?y))"),
+        rewrite!("is-sym"; "(is ?x ?y)" => "(is ?y ?x)"),
         //  Modulo: no direct rewrite rules (x % 1 ?0 requires constant detection).
         //          Remainder is still useful as a non-opaque node ?it allows
         //          surrounding AND/OR rules to fire instead of treating the
@@ -1477,6 +1562,8 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::BitAnd(_) => SqlLang::BitAnd([child_ids[0], child_ids[1]]),
         SqlLang::BitOr(_) => SqlLang::BitOr([child_ids[0], child_ids[1]]),
         SqlLang::Remainder(_) => SqlLang::Remainder([child_ids[0], child_ids[1]]),
+        SqlLang::Is(_) => SqlLang::Is([child_ids[0], child_ids[1]]),
+        SqlLang::IsNot(_) => SqlLang::IsNot([child_ids[0], child_ids[1]]),
         SqlLang::Symbol(k) => SqlLang::Symbol(*k),
     }
 }
@@ -1596,6 +1683,17 @@ fn eval(
         SqlLang::NotEq([l, r]) => order_compare(expr, *l, *r, symbols, assignment, |o| {
             o != std::cmp::Ordering::Equal
         }),
+        // IS is = with NULL as an ordinary value: never NULL itself.
+        SqlLang::Is([l, r]) | SqlLang::IsNot([l, r]) => {
+            let lv = eval(expr, *l, symbols, assignment);
+            let rv = eval(expr, *r, symbols, assignment);
+            let same = match (&lv, &rv) {
+                (SqlValue::Null, SqlValue::Null) => true,
+                (SqlValue::Null, _) | (_, SqlValue::Null) => false,
+                _ => lv.partial_cmp(&rv) == Some(std::cmp::Ordering::Equal),
+            };
+            SqlValue::Bool(same == matches!(&expr[root], SqlLang::Is(_)))
+        }
         // partial_cmp answers None only when an operand is NULL, and an order comparison with a
         // NULL operand is NULL, not FALSE. Reading None as FALSE made `NULL < 5` false here while
         // SQLite returns NULL, which is exactly the difference a rewrite under a NOT turns into a
