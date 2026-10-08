@@ -48,12 +48,16 @@ POSTFIX = {"isnull": "IS NULL", "isnotnull": "IS NOT NULL", "istrue": "IS TRUE",
 EXTENSION = {"is": "({} IS {})", "isnot": "({} IS NOT {})", "uplus": "(+{})",
              "in": "({} IN {})", "notin": "({} NOT IN {})", "list2": "({}, {})",
              "iif": "iif({}, {}, {})", "case": "(CASE WHEN {} THEN {} ELSE {} END)",
+             "case2": "(CASE WHEN {} THEN {} WHEN {} THEN {} ELSE {} END)",
+             "casesimple": "(CASE {} WHEN {} THEN {} ELSE {} END)",
              "coalesce": "coalesce({}, {})", "ifnull": "ifnull({}, {})", "nullif": "nullif({}, {})",
              "cast_int": "CAST({} AS INTEGER)", "cast_real": "CAST({} AS REAL)",
-             "cast_text": "CAST({} AS TEXT)", "cast_numeric": "CAST({} AS NUMERIC)"}
+             "cast_text": "CAST({} AS TEXT)", "cast_numeric": "CAST({} AS NUMERIC)",
+             "cast_blob": "CAST({} AS BLOB)"}
 # Operators whose result is a value that can carry a collation onward, not a truth value.
 VALUE_OPS = {"+", "-", "*", "/", "rem", "concat", "bitand", "bitor", "neg", "bitnot", "uplus", "iif", "case",
-             "coalesce", "ifnull", "nullif", "cast_int", "cast_real", "cast_text", "cast_numeric"}
+             "case2", "casesimple",
+             "coalesce", "ifnull", "nullif", "cast_int", "cast_real", "cast_text", "cast_numeric", "cast_blob"}
 
 # Context around a value-producing side: (template, operand) with {e} for the side.
 # Numeric-looking text and typed columns expose affinity: a column carries its affinity into a
@@ -127,7 +131,25 @@ def options():
     return [("lit", lit) for lit in LITERALS] + [("col", c) for c in COLUMNS] + [("col", EXPLICIT)]
 
 
+def sample_bindings(n):
+    rnd = random.Random(n)
+    out = []
+    while len(out) < SAMPLE:
+        choice = tuple(rnd.choice(options()) for _ in range(n))
+        if sum(1 for kind, _ in choice if kind == "col") <= 2:
+            out.append(choice)
+    return out
+
+
 def check_rule(rule):
+    try:
+        return check_rule_unguarded(rule)
+    except (ValueError, IndexError) as e:
+        # One rule the checker cannot read must not take the batch down with it.
+        return {"name": rule[0], "status": "ERROR", "detail": "cannot check: %s" % e}
+
+
+def check_rule_unguarded(rule):
     name, lhs_text, rhs_text = rule
     lhs, rhs = parse(lhs_text), parse(rhs_text)
     vs = variables(lhs)
@@ -145,7 +167,9 @@ def check_rule(rule):
     checked = 0
     # Exhaustive up to three variables (24389 bindings); beyond that a fixed-seed sample of
     # SAMPLE bindings, each still run in every context. Four variables would be 707281, five 20.5M.
-    choices = list(itertools.product(options(), repeat=len(vs))) if len(vs) <= 3 else         [tuple(rnd.choice(options()) for _ in vs) for rnd in [random.Random(len(vs))] for _ in range(SAMPLE)]
+    # A sampled binding puts at most two variables on columns: each column variable multiplies the
+    # rows a statement joins by 20, and five of them made one statement 3.2 million rows.
+    choices = list(itertools.product(options(), repeat=len(vs))) if len(vs) <= 3 else sample_bindings(len(vs))
     for choice in choices:
         cols = [c for c in choice if c[0] == "col"]
         if name in OPERAND_SWAPPING and len(vs) >= 2:
@@ -164,26 +188,37 @@ def check_rule(rule):
                 binding[var] = expr
                 shown.append("'%s=%s:' || quote(%s)" % (var, val, expr))
         l_sql, r_sql = to_sql(lhs, binding), to_sql(rhs, binding)
-        for ctx in contexts:
-            uses_w = "w." in ctx
-            if uses_w and len(frm) >= 2:
-                continue  # keeps the join small; a partner column is tried with up to one column operand
-            le, re_ = ctx.format(e=l_sql), ctx.format(e=r_sql)
+        # All contexts of a binding in one statement; only a binding that fails somewhere is run
+        # again context by context to say where.
+        groups = [[c for c in contexts if "w." not in c]]
+        if len(frm) < 2:
+            groups.append([c for c in contexts if "w." in c])
+        for group in groups:
+            if not group:
+                continue
+            uses_w = "w." in group[0]
             sources = frm + (["w"] if uses_w else [])
-            sql = "SELECT %s, quote(%s), quote(%s)%s %s WHERE quote(%s) IS NOT quote(%s) LIMIT 1" % (
-                " || ' ' || ".join(shown) if shown else "''", le, re_,
-                ", quote(w.c_text)" if uses_w else ", NULL",
-                ("FROM " + ", ".join(sources)) if sources else "", le, re_)
-            checked += 1
+            source_sql = ("FROM " + ", ".join(sources)) if sources else ""
+            any_mismatch = " OR ".join("quote(%s) IS NOT quote(%s)" % (c.format(e=l_sql), c.format(e=r_sql))
+                                       for c in group)
+            checked += len(group)
             try:
-                row = db.execute(sql).fetchone()
+                hit = db.execute("SELECT 1 %s WHERE %s LIMIT 1" % (source_sql, any_mismatch)).fetchone()
             except sqlite3.Error as e:
-                return {"name": name, "status": "FAIL", "context": ctx, "binding": str(choice),
+                return {"name": name, "status": "FAIL", "context": group[0], "binding": str(choice),
                         "detail": "error: %s" % e, "lhs": lhs_text, "rhs": rhs_text}
-            if row is not None:
-                return {"name": name, "status": "FAIL", "context": ctx, "binding": row[0],
-                        "lhs_value": row[1], "rhs_value": row[2], "partner": row[3],
-                        "lhs": lhs_text, "rhs": rhs_text, "lhs_sql": le, "rhs_sql": re_}
+            if hit is None:
+                continue
+            for ctx in group:
+                le, re_ = ctx.format(e=l_sql), ctx.format(e=r_sql)
+                sql = "SELECT %s, quote(%s), quote(%s)%s %s WHERE quote(%s) IS NOT quote(%s) LIMIT 1" % (
+                    " || ' ' || ".join(shown) if shown else "''", le, re_,
+                    ", quote(w.c_text)" if uses_w else ", NULL", source_sql, le, re_)
+                row = db.execute(sql).fetchone()
+                if row is not None:
+                    return {"name": name, "status": "FAIL", "context": ctx, "binding": row[0],
+                            "lhs_value": row[1], "rhs_value": row[2], "partner": row[3],
+                            "lhs": lhs_text, "rhs": rhs_text, "lhs_sql": le, "rhs_sql": re_}
     return {"name": name, "status": "PASS", "checked": checked}
 
 

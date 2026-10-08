@@ -720,18 +720,19 @@ fn sql_expr_to_recexpr_impl(
             })
         }
 
-        // A searched CASE with one WHEN. A missing ELSE is ELSE NULL. More WHENs, and the simple
-        // form CASE x WHEN ..., stay one opaque atom.
+        // Every CASE becomes nested one-WHEN case nodes: WHEN c1 THEN a1 WHEN c2 THEN a2 ELSE b is
+        // case(c1, a1, case(c2, a2, b)), and the simple form CASE x WHEN v ... compares with =, so
+        // it is case(x = v, ...). A missing ELSE is ELSE NULL. Both readings were checked against
+        // SQLite with rulegate.py (case2-to-nested, casesimple-to-searched), collation and affinity
+        // contexts included. The collation guard sees the comparisons the simple form implies.
         SqlExpr::Case {
-            operand: None,
+            operand,
             conditions,
             else_result,
             ..
-        } if conditions.len() == 1 => {
-            let c = sql_expr_to_recexpr_impl(&conditions[0].condition, rec, symbols, counter, dedup, source_sql);
-            let a = sql_expr_to_recexpr_impl(&conditions[0].result, rec, symbols, counter, dedup, source_sql);
+        } if !conditions.is_empty() => {
             let null = SqlExpr::Value(Value::Null.into());
-            let b = sql_expr_to_recexpr_impl(
+            let mut tail = sql_expr_to_recexpr_impl(
                 else_result.as_deref().unwrap_or(&null),
                 rec,
                 symbols,
@@ -739,7 +740,19 @@ fn sql_expr_to_recexpr_impl(
                 dedup,
                 source_sql,
             );
-            rec.add(SqlLang::Case([c, a, b]))
+            for when in conditions.iter().rev() {
+                let c = match operand {
+                    None => sql_expr_to_recexpr_impl(&when.condition, rec, symbols, counter, dedup, source_sql),
+                    Some(x) => {
+                        let x = sql_expr_to_recexpr_impl(x, rec, symbols, counter, dedup, source_sql);
+                        let v = sql_expr_to_recexpr_impl(&when.condition, rec, symbols, counter, dedup, source_sql);
+                        rec.add(SqlLang::Eq([x, v]))
+                    }
+                };
+                let a = sql_expr_to_recexpr_impl(&when.result, rec, symbols, counter, dedup, source_sql);
+                tail = rec.add(SqlLang::Case([c, a, tail]));
+            }
+            tail
         }
 
         SqlExpr::Nested(inner) => {
@@ -789,13 +802,13 @@ pub fn contains_row_value(expr: &SqlExpr) -> bool {
         }
         // A one-WHEN CASE is a node now, so the rules reach inside it.
         SqlExpr::Case {
-            operand: None,
+            operand,
             conditions,
             else_result,
             ..
-        } if conditions.len() == 1 => {
-            contains_row_value(&conditions[0].condition)
-                || contains_row_value(&conditions[0].result)
+        } => {
+            operand.as_deref().map_or(false, contains_row_value)
+                || conditions.iter().any(|w| contains_row_value(&w.condition) || contains_row_value(&w.result))
                 || else_result.as_deref().map_or(false, contains_row_value)
         }
         // `(a, b) IS (c, d)` compares row values, and the IS rules write each side twice.
@@ -857,6 +870,12 @@ fn compares_two_collations_here(expr: &SqlExpr) -> bool {
     };
     match expr {
         SqlExpr::BinaryOp { left, op, right } => is_collation_sensitive_operator(op) && two_sides(left, right),
+        // CASE x WHEN v ... is read as x = v.
+        SqlExpr::Case {
+            operand: Some(x),
+            conditions,
+            ..
+        } => conditions.iter().any(|w| two_sides(x, &w.condition)),
         // IS picks its collation the way = does.
         SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => two_sides(left, right),
         SqlExpr::Between {
@@ -1658,6 +1677,86 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("isnull-via-is-reflexive"; "(isnull ?x)" => "(is (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnotnull-via-isnot-reflexive"; "(isnotnull ?x)" => "(isnot (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnot-sym"; "(isnot ?x ?y)" => "(isnot ?y ?x)"),
+        //  CASE (the case node; agent round 3). case-and-nest, case-same-cond-then and -else failed: they move or drop a sub-expression whose explicit COLLATE decides the collation of the CASE result.
+        rewrite!("case-istrue-cond"; "(case ?c ?a ?b)" => "(case (istrue ?c) ?a ?b)"),
+        rewrite!("case-not-cond-to-isfalse"; "(case (not ?c) ?a ?b)" => "(case (isfalse ?c) ?a ?b)"),
+        rewrite!("case-isnull-swap"; "(case (isnull ?x) ?a ?b)" => "(case (isnotnull ?x) ?b ?a)"),
+        rewrite!("case-is-swap"; "(case (is ?x ?y) ?a ?b)" => "(case (isnot ?x ?y) ?b ?a)"),
+        rewrite!("case-istrue-swap"; "(case (istrue ?c) ?a ?b)" => "(case (isnottrue ?c) ?b ?a)"),
+        rewrite!("case-isfalse-swap"; "(case (isfalse ?c) ?a ?b)" => "(case (isnotfalse ?c) ?b ?a)"),
+        rewrite!("case-or-nest"; "(case (or ?c ?d) ?a ?b)" => "(case ?c ?a (case ?d ?a ?b))"),
+        rewrite!("case-cond-case"; "(case (case ?c ?d ?e) ?a ?b)" => "(case ?c (case ?d ?a ?b) (case ?e ?a ?b))"),
+        rewrite!("not-into-case"; "(not (case ?c ?a ?b))" => "(case ?c (not ?a) (not ?b))"),
+        rewrite!("isnull-into-case"; "(isnull (case ?c ?a ?b))" => "(case ?c (isnull ?a) (isnull ?b))"),
+        rewrite!("istrue-into-case"; "(istrue (case ?c ?a ?b))" => "(case ?c (istrue ?a) (istrue ?b))"),
+        rewrite!("neg-into-case"; "(neg (case ?c ?a ?b))" => "(case ?c (neg ?a) (neg ?b))"),
+        rewrite!("bitnot-into-case"; "(bitnot (case ?c ?a ?b))" => "(case ?c (bitnot ?a) (bitnot ?b))"),
+        rewrite!("add-into-case"; "(+ (case ?c ?a ?b) ?d)" => "(case ?c (+ ?a ?d) (+ ?b ?d))"),
+        rewrite!("concat-into-case"; "(concat (case ?c ?a ?b) ?d)" => "(case ?c (concat ?a ?d) (concat ?b ?d))"),
+        rewrite!("and-into-case"; "(and (case ?c ?a ?b) ?d)" => "(case ?c (and ?a ?d) (and ?b ?d))"),
+        rewrite!("or-into-case"; "(or (case ?c ?a ?b) ?d)" => "(case ?c (or ?a ?d) (or ?b ?d))"),
+        rewrite!("istrue-to-case"; "(istrue ?x)" => "(case ?x (isnotnull ?x) (isnull (isnull ?x)))"),
+        rewrite!("isnottrue-to-case"; "(isnottrue ?x)" => "(case ?x (isnull ?x) (isnotnull (isnull ?x)))"),
+        rewrite!("isfalse-to-case"; "(isfalse ?x)" => "(case (not ?x) (isnotnull ?x) (isnull (isnull ?x)))"),
+        rewrite!("and-to-case"; "(and ?x ?y)" => "(case ?x (not (not ?y)) (and ?x ?y))"),
+        rewrite!("or-to-case"; "(or ?x ?y)" => "(case ?x (isnotnull ?x) (or ?x ?y))"),
+        rewrite!("case-bool-to-andor"; "(case ?c (not ?a) (not ?b))" => "(or (and (istrue ?c) (not ?a)) (and (isnottrue ?c) (not ?b)))"),
+        //  coalesce / nullif (agent round 4).
+        rewrite!("coalesce-assoc"; "(coalesce (coalesce ?a ?b) ?c)" => "(coalesce ?a (coalesce ?b ?c))"),
+        rewrite!("coalesce-to-case"; "(coalesce ?a ?b)" => "(case (isnotnull ?a) ?a ?b)"),
+        rewrite!("case-isnull-to-coalesce"; "(case (isnull ?a) ?b ?a)" => "(coalesce ?a ?b)"),
+        rewrite!("isnotnull-coalesce"; "(isnotnull (coalesce ?a ?b))" => "(or (isnotnull ?a) (isnotnull ?b))"),
+        rewrite!("istrue-coalesce"; "(istrue (coalesce ?a ?b))" => "(or (istrue ?a) (and (isnull ?a) (istrue ?b)))"),
+        rewrite!("isfalse-coalesce"; "(isfalse (coalesce ?a ?b))" => "(or (isfalse ?a) (and (isnull ?a) (isfalse ?b)))"),
+        rewrite!("istrue-coalesce-case"; "(istrue (coalesce ?a ?b))" => "(case (isnull ?a) (istrue ?b) (istrue ?a))"),
+        rewrite!("not-into-coalesce"; "(not (coalesce ?a ?b))" => "(coalesce (not ?a) (not ?b))"),
+        rewrite!("neg-into-coalesce"; "(neg (coalesce ?a ?b))" => "(coalesce (neg ?a) (neg ?b))"),
+        rewrite!("bitnot-into-coalesce"; "(bitnot (coalesce ?a ?b))" => "(coalesce (bitnot ?a) (bitnot ?b))"),
+        rewrite!("bitand-into-coalesce"; "(bitand (coalesce ?a ?b) ?c)" => "(coalesce (bitand ?a ?c) (bitand ?b ?c))"),
+        rewrite!("bitor-into-coalesce"; "(bitor (coalesce ?a ?b) ?c)" => "(coalesce (bitor ?a ?c) (bitor ?b ?c))"),
+        rewrite!("concat-into-coalesce"; "(concat (coalesce ?a ?b) ?c)" => "(coalesce (concat ?a ?c) (concat ?b ?c))"),
+        rewrite!("coalesce-dup-inner"; "(coalesce ?a (coalesce ?a ?b))" => "(coalesce ?a ?b)"),
+        rewrite!("coalesce-absorb-tail"; "(coalesce (coalesce ?a ?b) ?a)" => "(coalesce ?a ?b)"),
+        rewrite!("coalesce-dead-fallback-isnull"; "(coalesce (isnull ?a) ?b)" => "(isnull ?a)"),
+        rewrite!("coalesce-dead-fallback-istrue"; "(coalesce (istrue ?a) ?b)" => "(istrue ?a)"),
+        rewrite!("coalesce-dead-fallback-is"; "(coalesce (is ?x ?y) ?b)" => "(is ?x ?y)"),
+        rewrite!("case-coalesce-cond"; "(case (coalesce ?c ?d) ?x ?y)" => "(case (or (istrue ?c) (and (isnull ?c) (istrue ?d))) ?x ?y)"),
+        rewrite!("coalesce-into-case"; "(coalesce (case ?c ?a ?b) ?d)" => "(case ?c (coalesce ?a ?d) (coalesce ?b ?d))"),
+        rewrite!("not-coalesce-self"; "(not (coalesce ?a ?a))" => "(not ?a)"),
+        rewrite!("coalesce-nullif-reorder"; "(coalesce (nullif ?a ?b) ?a)" => "(coalesce ?a (nullif ?a ?b))"),
+        rewrite!("istrue-nullif"; "(istrue (nullif ?a ?b))" => "(and (istrue ?a) (isnotnull (nullif ?a ?b)))"),
+        rewrite!("isfalse-nullif"; "(isfalse (nullif ?a ?b))" => "(and (isfalse ?a) (isnotnull (nullif ?a ?b)))"),
+        rewrite!("not-nullif-guard"; "(not (nullif ?a ?b))" => "(case (isnull (nullif ?a ?b)) (nullif ?a ?b) (not ?a))"),
+        //  CAST (agent round 5). The three *-sym-cast-* swaps are reached by the guarded swap rules when those are allowed; they are kept for the queries the guard withholds them from, which is sound because both sides are numbers after the cast.
+        rewrite!("cast-real-idem"; "(cast_real (cast_real ?x))" => "(cast_real ?x)"),
+        rewrite!("cast-text-idem"; "(cast_text (cast_text ?x))" => "(cast_text ?x)"),
+        rewrite!("cast-blob-idem"; "(cast_blob (cast_blob ?x))" => "(cast_blob ?x)"),
+        rewrite!("cast-numeric-idem"; "(cast_numeric (cast_numeric ?x))" => "(cast_numeric ?x)"),
+        rewrite!("cast-numeric-of-int"; "(cast_numeric (cast_int ?x))" => "(cast_int ?x)"),
+        rewrite!("cast-real-of-numeric"; "(cast_real (cast_numeric ?x))" => "(cast_real ?x)"),
+        rewrite!("cast-blob-of-text"; "(cast_blob (cast_text ?x))" => "(cast_blob ?x)"),
+        rewrite!("cast-text-of-blob"; "(cast_text (cast_blob ?x))" => "(cast_text ?x)"),
+        rewrite!("isnull-cast-int"; "(isnull (cast_int ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-cast-real"; "(isnull (cast_real ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-cast-text"; "(isnull (cast_text ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-cast-numeric"; "(isnull (cast_numeric ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-cast-blob"; "(isnull (cast_blob ?x))" => "(isnull ?x)"),
+        rewrite!("isnotnull-cast-int"; "(isnotnull (cast_int ?x))" => "(isnotnull ?x)"),
+        rewrite!("bitand-drop-cast-int"; "(bitand (cast_int ?x) ?y)" => "(bitand ?x ?y)"),
+        rewrite!("bitor-drop-cast-int"; "(bitor (cast_int ?x) ?y)" => "(bitor ?x ?y)"),
+        rewrite!("bitnot-drop-cast-int"; "(bitnot (cast_int ?x))" => "(bitnot ?x)"),
+        rewrite!("concat-drop-cast-text-left"; "(concat (cast_text ?x) ?y)" => "(concat ?x ?y)"),
+        rewrite!("concat-drop-cast-text-right"; "(concat ?x (cast_text ?y))" => "(concat ?x ?y)"),
+        rewrite!("istrue-drop-cast-real"; "(istrue (cast_real ?x))" => "(istrue ?x)"),
+        rewrite!("not-drop-cast-real"; "(not (cast_real ?x))" => "(not ?x)"),
+        rewrite!("case-cond-drop-cast-real"; "(case (cast_real ?c) ?a ?b)" => "(case ?c ?a ?b)"),
+        rewrite!("istrue-drop-cast-numeric"; "(istrue (cast_numeric ?x))" => "(istrue ?x)"),
+        rewrite!("eq-sym-cast-int"; "(= (cast_int ?x) (cast_int ?y))" => "(= (cast_int ?y) (cast_int ?x))"),
+        rewrite!("lt-sym-cast-int"; "(< (cast_int ?x) (cast_int ?y))" => "(> (cast_int ?y) (cast_int ?x))"),
+        rewrite!("eq-sym-cast-real"; "(= (cast_real ?x) (cast_real ?y))" => "(= (cast_real ?y) (cast_real ?x))"),
+        rewrite!("cast-int-into-coalesce"; "(cast_int (coalesce ?a ?b))" => "(cast_int (coalesce (cast_int ?a) (cast_int ?b)))"),
+        rewrite!("cast-int-into-case"; "(cast_int (case ?c ?a ?b))" => "(cast_int (case ?c (cast_int ?a) (cast_int ?b)))"),
+        rewrite!("cast-text-into-coalesce"; "(cast_text (coalesce ?a ?b))" => "(cast_text (coalesce (cast_text ?a) (cast_text ?b)))"),
         //  Modulo: no direct rewrite rules (x % 1 ?0 requires constant detection).
         //          Remainder is still useful as a non-opaque node ?it allows
         //          surrounding AND/OR rules to fire instead of treating the
