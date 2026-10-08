@@ -1,0 +1,128 @@
+# Candidate rules over fn:* (agent1, round 7). Nothing here has been run yet: every rule should go through rulegate.
+# Design constraints I followed, after the round-6 lesson:
+#   - Whenever a rule rewrites one value-producing expression into another, the explicitly-collated leaves keep the same left-to-right order, and none is duplicated
+#     ahead of another or dropped. Usually the rule only wraps or unwraps one argument chain.
+#   - Rules whose two sides are both 0/1/NULL integers (or always-INTEGER results) are immune to collation and affinity, and are used freely.
+#   - Rules never replace a function call by a bare argument (no affinity on the call), except the one experimental likely-drop rule, which is marked.
+#   - No rule adds or removes abs() around something that can be int64 MIN (abs(MIN) raises an error).
+# Rejected after checking:
+#   length(upper x) => length(x): for a BLOB, length counts bytes, while length(upper(blob)) counts the characters of the text.
+#   max(x,y) => max(y,x): a tie returns the LATER argument (max(1,1.0) = 1.0, max(1.0,1) = 1), and the collation comes from the first argument with one (implicit included).
+#   max/min associativity: the inner call loses the implicit collation, so the outer comparison collation can change.
+#   abs(neg x) => abs(x): abs(MIN) raises an error, while neg(MIN) gives a REAL.
+#   sign(neg x) => neg(sign x): sign('abc') is NULL but sign(0) is 0.
+#   sign(round x) => sign(x): round(0.4) is 0.0.
+#   isnull(sign x) => isnull(x), and isnull(unicode x): both give NULL on non-NULL input ('abc', '').
+#   isnull(hex x) / isnull(quote x): hex(NULL) is '' and quote(NULL) is 'NULL', so neither is ever NULL.
+#   (like ?x ?x) => (isnotnull ?x): it already failed in round 6.
+#   max(istrue a, istrue b) is fine (rule below), but max(= a b, = c d) => (or …) is NOT: max(1,NULL) is NULL, while 1 OR NULL is 1.
+
+## Case mapping and trimming (ASCII-only lower/upper; both always return TEXT for non-NULL input; the explicit-collation chain is through the single argument)
+
+lower-idem ; (fn:lower (fn:lower ?x)) => (fn:lower ?x)
+#   ASCII lowercasing is idempotent, and non-ASCII bytes are untouched. Both sides are TEXT with no affinity and the same argument chain.
+upper-idem ; (fn:upper (fn:upper ?x)) => (fn:upper ?x)
+#   Same argument as lower-idem.
+upper-of-lower ; (fn:upper (fn:lower ?x)) => (fn:upper ?x)
+#   For each ASCII letter, upper(lower(c)) = upper(c), and other bytes are unchanged by both functions.
+#   SLIGHTLY UNSURE: this would break only if the build has ICU or an overloaded lower/upper with Unicode case folding (e.g. 'ß' or the Turkish dotless i).
+lower-of-upper ; (fn:lower (fn:upper ?x)) => (fn:lower ?x)
+#   Same argument and same ICU caveat as upper-of-lower.
+trim-idem ; (fn:trim (fn:trim ?x)) => (fn:trim ?x)
+#   After trimming there are no leading or trailing spaces left. The same rule works for ltrim and rtrim.
+ltrim-rtrim-to-trim ; (fn:ltrim (fn:rtrim ?x)) => (fn:trim ?x)
+#   Removing trailing spaces and then leading spaces equals removing both. All three return TEXT (the number rendering is the same).
+rtrim-ltrim-to-trim ; (fn:rtrim (fn:ltrim ?x)) => (fn:trim ?x)
+#   Same argument as ltrim-rtrim-to-trim.
+trim-of-ltrim ; (fn:trim (fn:ltrim ?x)) => (fn:trim ?x)
+#   trim also removes the leading spaces that ltrim already removed. The same rule works for (fn:trim (fn:rtrim ?x)), (fn:ltrim (fn:trim ?x)) and (fn:rtrim (fn:trim ?x)).
+lower-trim-commute ; (fn:lower (fn:trim ?x)) => (fn:trim (fn:lower ?x))
+#   Lowercasing never creates or removes spaces, and trimming never changes letters. The value is the same TEXT, and the argument chain is the same single x. The same rule works for upper.
+upper-concat-dist ; (fn:upper (concat ?x ?y)) => (concat (fn:upper ?x) (fn:upper ?y))
+#   ASCII upper is byte-wise, and NULL in either operand gives NULL on both sides. The explicit-collation order x,y is kept, and nothing is duplicated.
+#   SLIGHTLY UNSURE: this assumes a BLOB or embedded NUL bytes are handled the same way when upper is applied before or after concatenation (both use sqlite3_value_text/bytes). The same rule works for lower.
+upper-of-hex ; (fn:upper (fn:hex ?x)) => (fn:hex ?x)
+#   hex() already emits uppercase digits A-F only, and both sides are TEXT function results with the same argument chain.
+trim-of-hex ; (fn:trim (fn:hex ?x)) => (fn:hex ?x)
+#   hex() output contains no spaces. hex(NULL) is '', and trim('') is ''.
+
+## Length / typeof facts
+
+length-upper-to-lower ; (fn:length (fn:upper ?x)) => (fn:length (fn:lower ?x))
+#   Both are TEXT of the same bytes up to ASCII case, so the character count (up to the first NUL) is equal. NULL gives NULL on both sides. The result is an integer.
+length-lower-to-cast-text ; (fn:length (fn:lower ?x)) => (fn:length (cast_text ?x))
+#   lower reads x as text (a BLOB as its bytes) and keeps the byte length and character boundaries, so the count is the same as for the text cast. The result is an integer, so collation and affinity are irrelevant.
+typeof-lower-to-cast-text ; (fn:typeof (fn:lower ?x)) => (fn:typeof (cast_text ?x))
+#   Both give 'null' for NULL and 'text' otherwise. The typeof result's collation comes only from an explicit COLLATE in x, which is the same chain on both sides. The same rule works for upper/trim/ltrim/rtrim.
+typeof-cmp-to-bitand ; (fn:typeof (= ?x ?y)) => (fn:typeof (bitand ?x ?y))
+#   = is NULL iff x or y is NULL, and is otherwise an integer. & has exactly the same NULL condition and is otherwise an integer. The explicit-collation chain is x then y on both sides.
+#   The same rule works for every comparison operator, and for bitor.
+
+## NULL in, NULL out (both sides 0/1)
+
+isnull-lower ; (isnull (fn:lower ?x)) => (isnull ?x)
+#   lower returns NULL only for NULL input. The same rule works for upper.
+isnull-trim ; (isnull (fn:trim ?x)) => (isnull ?x)
+#   The 1-argument trim returns NULL only for NULL input. The same rule works for ltrim and rtrim.
+isnull-length ; (isnull (fn:length ?x)) => (isnull ?x)
+#   length returns an integer for any non-NULL value, including a BLOB, a number or ''.
+isnull-round ; (isnull (fn:round ?x)) => (isnull ?x)
+#   round('abc') is 0.0, round(Inf) is Inf, and only NULL maps to NULL.
+isnull-instr ; (isnull (fn:instr ?x ?y)) => (or (isnull ?x) (isnull ?y))
+#   instr returns NULL iff either argument is NULL.
+isnull-substr ; (isnull (fn:substr ?x ?y ?z)) => (or (isnull ?x) (or (isnull ?y) (isnull ?z)))
+#   substr returns NULL iff any argument is NULL. Non-numeric y/z are converted to 0, not NULL.
+isnull-max2 ; (isnull (fn:max ?x ?y)) => (or (isnull ?x) (isnull ?y))
+#   Multi-argument scalar max returns NULL iff any argument is NULL.
+isnull-min2 ; (isnull (fn:min ?x ?y)) => (or (isnull ?x) (isnull ?y))
+#   Same argument as isnull-max2.
+isnull-likely ; (isnull (fn:likely ?x)) => (isnull ?x)
+#   likely returns its argument unchanged. The same rule works for unlikely.
+
+## Idempotence of numeric functions
+
+abs-idem ; (fn:abs (fn:abs ?x)) => (fn:abs ?x)
+#   abs of a non-negative integer or REAL is the identity; -0.0 is not < 0, so it is left as -0.0 both times; TEXT/BLOB gives a REAL >= 0. If x is int64 MIN, the inner abs raises an error on both sides.
+sign-idem ; (fn:sign (fn:sign ?x)) => (fn:sign ?x)
+#   sign yields -1/0/1 INTEGER or NULL, and sign is the identity on those values.
+round-idem ; (fn:round (fn:round ?x)) => (fn:round ?x)
+#   round(x) with no digits argument gives a REAL with integral value (or leaves very large values unchanged). Rounding that again is the identity.
+#   SLIGHTLY UNSURE: SQLite's round goes through printf/AtoF for some magnitudes. Test it with 2.5, -2.5, 0.49999999999999994, 4503599627370495.5 and 1e300.
+hex-of-cast-blob ; (fn:hex (cast_blob ?x)) => (fn:hex ?x)
+#   hex() reads its argument's bytes. A number is rendered as text first, which is exactly what CAST AS BLOB stores. hex(NULL) is '', the same on both sides.
+hex-of-cast-text ; (fn:hex (cast_text ?x)) => (fn:hex ?x)
+#   CAST AS TEXT keeps a BLOB's bytes, and hex reads them back. A number has the same text rendering either way.
+#   UNSURE in a UTF-16 database, or for BLOBs that are invalid UTF-8 if any conversion normalises them. It should be fine in UTF-8.
+
+## likely / unlikely (the value is the argument)
+
+likely-idem ; (fn:likely (fn:likely ?x)) => (fn:likely ?x)
+#   Same value, same argument chain.
+istrue-likely ; (istrue (fn:likely ?x)) => (istrue ?x)
+#   Same value, so the same truth. The result is 0/1. The same rule works for isfalse/isnottrue/isnotfalse/not and for unlikely.
+case-likely-cond ; (case (fn:likely ?c) ?a ?b) => (case ?c ?a ?b)
+#   The condition has the same truth. The branches are untouched, and the explicit-collation chain through c is unchanged.
+likely-of-cmp ; (fn:likely (= ?x ?y)) => (= ?x ?y)
+#   Both are 0/1/NULL integers, so affinity and collation cannot matter. The same rule works for every node that is always 0/1/NULL: comparisons, is/isnot, isnull, istrue, like, in*.
+typeof-likely ; (fn:typeof (fn:likely ?x)) => (fn:typeof ?x)
+#   likely passes the value through unchanged, including its storage class. The argument chain is the same. The same rule works for quote/length/hex/lower/upper.
+likely-drop ; (fn:likely ?x) => ?x
+#   EXPERIMENTAL / UNSURE. I recall that SQLite marks likely()/unlikely() with EP_Skip and that sqlite3ExprAffinity/sqlite3ExprCollSeq skip through EP_Skip nodes. If so, likely(col) keeps col's affinity and collation and this is fully sound.
+#   If rulegate finds that likely(col) = '1' differs from col = '1', the rule is out. If it fails in only some contexts, that is an inconsistency worth looking at.
+
+## Integer-valued results, where function and operator agree
+
+abs-of-bool ; (fn:abs (istrue ?x)) => (istrue ?x)
+#   abs is the identity on INTEGER 0/1, and both sides are integers. The same rule works for comparisons/is/isnull results (abs(NULL) is NULL).
+sign-of-cmp ; (fn:sign (= ?x ?y)) => (= ?x ?y)
+#   sign is the identity on INTEGER 0, 1 and NULL. The same rule works for every 0/1/NULL node.
+max-of-bools-to-or ; (fn:max (istrue ?a) (istrue ?b)) => (or (istrue ?a) (istrue ?b))
+#   Both arguments are non-NULL 0/1 integers, so max is 1 iff either is 1, and a tie returns the same integer value. Both sides are integers.
+min-of-bools-to-and ; (fn:min (istrue ?a) (istrue ?b)) => (and (istrue ?a) (istrue ?b))
+#   Same argument, with min and AND.
+max-self-to-min-self ; (fn:max ?x ?x) => (fn:min ?x ?x)
+#   With identical arguments, both return x's value (a tie picks the later argument, which is the same value). The arguments, the order and the collation choice are identical. NULL gives NULL.
+istrue-lower ; (istrue (fn:lower ?x)) => (istrue ?x)
+#   The truth of TEXT is decided by its numeric prefix. Lowercasing changes only letters, and the only letter in a numeric prefix is the exponent e/E, which both forms accept.
+#   A REAL renders to text that reparses to a value with the same zero-ness, and a BLOB is truth-tested through its text anyway.
+#   UNSURE: this assumes SQLite never parses 'INF', 'NaN' or hex in the truth test. The same rule works for upper.

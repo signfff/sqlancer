@@ -80,7 +80,15 @@ pub enum SqlLang {
 
 impl Language for SqlLang {
     fn matches(&self, other: &Self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match (self, other) {
+            // The function name is part of what a pattern asks for. Comparing the variant alone let
+            // (fn:likely ?x) match hex(x): isnull-likely then made isnull(hex(c)) - always 0 - equal
+            // to isnull(c), found by e2e.py on 2026-10-08.
+            (SqlLang::Call1(a, _), SqlLang::Call1(b, _))
+            | (SqlLang::Call2(a, _), SqlLang::Call2(b, _))
+            | (SqlLang::Call3(a, _), SqlLang::Call3(b, _)) => a == b,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 
     fn children(&self) -> &[Id] {
@@ -1858,6 +1866,48 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("isnull-via-is-reflexive"; "(isnull ?x)" => "(is (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnotnull-via-isnot-reflexive"; "(isnotnull ?x)" => "(isnot (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnot-sym"; "(isnot ?x ?y)" => "(isnot ?y ?x)"),
+        //  Function calls (fn:*, agent round 7). Left out: isnull-substr (substr(x'', 0, 0) is
+        //  NULL), abs-idem (abs of the int64 minimum is an error), likely-drop (a call has no
+        //  affinity, so likely(c) = '1' and c = '1' differ for an INTEGER column).
+        rewrite!("lower-idem"; "(fn:lower (fn:lower ?x))" => "(fn:lower ?x)"),
+        rewrite!("upper-idem"; "(fn:upper (fn:upper ?x))" => "(fn:upper ?x)"),
+        rewrite!("upper-of-lower"; "(fn:upper (fn:lower ?x))" => "(fn:upper ?x)"),
+        rewrite!("lower-of-upper"; "(fn:lower (fn:upper ?x))" => "(fn:lower ?x)"),
+        rewrite!("trim-idem"; "(fn:trim (fn:trim ?x))" => "(fn:trim ?x)"),
+        rewrite!("ltrim-rtrim-to-trim"; "(fn:ltrim (fn:rtrim ?x))" => "(fn:trim ?x)"),
+        rewrite!("rtrim-ltrim-to-trim"; "(fn:rtrim (fn:ltrim ?x))" => "(fn:trim ?x)"),
+        rewrite!("trim-of-ltrim"; "(fn:trim (fn:ltrim ?x))" => "(fn:trim ?x)"),
+        rewrite!("lower-trim-commute"; "(fn:lower (fn:trim ?x))" => "(fn:trim (fn:lower ?x))"),
+        rewrite!("upper-concat-dist"; "(fn:upper (concat ?x ?y))" => "(concat (fn:upper ?x) (fn:upper ?y))"),
+        rewrite!("upper-of-hex"; "(fn:upper (fn:hex ?x))" => "(fn:hex ?x)"),
+        rewrite!("trim-of-hex"; "(fn:trim (fn:hex ?x))" => "(fn:hex ?x)"),
+        rewrite!("length-upper-to-lower"; "(fn:length (fn:upper ?x))" => "(fn:length (fn:lower ?x))"),
+        rewrite!("length-lower-to-cast-text"; "(fn:length (fn:lower ?x))" => "(fn:length (cast_text ?x))"),
+        rewrite!("typeof-lower-to-cast-text"; "(fn:typeof (fn:lower ?x))" => "(fn:typeof (cast_text ?x))"),
+        rewrite!("typeof-cmp-to-bitand"; "(fn:typeof (= ?x ?y))" => "(fn:typeof (bitand ?x ?y))"),
+        rewrite!("isnull-lower"; "(isnull (fn:lower ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-trim"; "(isnull (fn:trim ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-length"; "(isnull (fn:length ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-round"; "(isnull (fn:round ?x))" => "(isnull ?x)"),
+        rewrite!("isnull-instr"; "(isnull (fn:instr ?x ?y))" => "(or (isnull ?x) (isnull ?y))"),
+        rewrite!("isnull-max2"; "(isnull (fn:max ?x ?y))" => "(or (isnull ?x) (isnull ?y))"),
+        rewrite!("isnull-min2"; "(isnull (fn:min ?x ?y))" => "(or (isnull ?x) (isnull ?y))"),
+        rewrite!("isnull-likely"; "(isnull (fn:likely ?x))" => "(isnull ?x)"),
+        rewrite!("sign-idem"; "(fn:sign (fn:sign ?x))" => "(fn:sign ?x)"),
+        rewrite!("round-idem"; "(fn:round (fn:round ?x))" => "(fn:round ?x)"),
+        rewrite!("hex-of-cast-blob"; "(fn:hex (cast_blob ?x))" => "(fn:hex ?x)"),
+        rewrite!("hex-of-cast-text"; "(fn:hex (cast_text ?x))" => "(fn:hex ?x)"),
+        rewrite!("likely-idem"; "(fn:likely (fn:likely ?x))" => "(fn:likely ?x)"),
+        rewrite!("istrue-likely"; "(istrue (fn:likely ?x))" => "(istrue ?x)"),
+        rewrite!("case-likely-cond"; "(case (fn:likely ?c) ?a ?b)" => "(case ?c ?a ?b)"),
+        rewrite!("likely-of-cmp"; "(fn:likely (= ?x ?y))" => "(= ?x ?y)"),
+        rewrite!("typeof-likely"; "(fn:typeof (fn:likely ?x))" => "(fn:typeof ?x)"),
+        rewrite!("abs-of-bool"; "(fn:abs (istrue ?x))" => "(istrue ?x)"),
+        rewrite!("sign-of-cmp"; "(fn:sign (= ?x ?y))" => "(= ?x ?y)"),
+        rewrite!("max-of-bools-to-or"; "(fn:max (istrue ?a) (istrue ?b))" => "(or (istrue ?a) (istrue ?b))"),
+        rewrite!("min-of-bools-to-and"; "(fn:min (istrue ?a) (istrue ?b))" => "(and (istrue ?a) (istrue ?b))"),
+        rewrite!("max-self-to-min-self"; "(fn:max ?x ?x)" => "(fn:min ?x ?x)"),
+        rewrite!("istrue-lower"; "(istrue (fn:lower ?x))" => "(istrue ?x)"),
         //  IN lists and LIKE / GLOB (agent round 6). Left out: like-self (NULL LIKE NULL is NULL),
         //  and every rule turning a one-element IN into a longer list or back. SQLite reads
         //  x IN (constant) as x = +constant, so an explicit COLLATE on the constant decides it, while
@@ -3845,6 +3895,19 @@ fn generate_equivalent_where_clauses_impl(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_function_pattern_matches_only_its_own_name() {
+        let rules: Vec<egg::Rewrite<SqlLang, ()>> =
+            vec![egg::rewrite!("isnull-likely"; "(isnull (fn:likely ?x))" => "(isnull ?x)")];
+        let hex: RecExpr<SqlLang> = "(isnull (fn:hex 900001))".parse().unwrap();
+        let bare: RecExpr<SqlLang> = "(isnull 900001)".parse().unwrap();
+        let runner = egg::Runner::default().with_expr(&hex).run(&rules);
+        assert_ne!(runner.egraph.lookup_expr(&bare).map(|i| runner.egraph.find(i)), Some(runner.egraph.find(runner.roots[0])));
+        let likely: RecExpr<SqlLang> = "(isnull (fn:likely 900001))".parse().unwrap();
+        let runner = egg::Runner::default().with_expr(&likely).run(&rules);
+        assert_eq!(runner.egraph.lookup_expr(&bare).map(|i| runner.egraph.find(i)), Some(runner.egraph.find(runner.roots[0])));
+    }
+
     use super::*;
 
     fn parse_predicate(sql: &str) -> SqlExpr {
