@@ -1,0 +1,27 @@
+######## 3.53.4 2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc
+== A: empty contentless FTS4
+unable to validate the inverted index for FTS4 table main.a: SQL logic error
+unable to validate the inverted index for FTS4 table main.a: SQL logic error
+== B: after a write (MATCH keeps working)
+1
+unable to validate the inverted index for FTS4 table main.a: SQL logic error
+== C: the FTS4 integrity-check command (failed even in 3.43.2 before the fix)
+Error near line 18: SQL logic error
+== D: control, ordinary FTS4
+== E: control, external-content FTS4
+== F: control, contentless FTS5
+== integrity of D, E, F alongside A
+unable to validate the inverted index for FTS4 table main.a: SQL logic error
+######## 3.54.0 2026-10-06 18:52:47 a435d786fe0e245e352d08d2e2ddf8c1e15154809e3b471810cc327e9d90ef85
+== A: empty contentless FTS4
+ok
+ok
+== B: after a write (MATCH keeps working)
+1
+ok
+== C: the FTS4 integrity-check command (failed even in 3.43.2 before the fix)
+== D: control, ordinary FTS4
+== E: control, external-content FTS4
+== F: control, contentless FTS5
+== integrity of D, E, F alongside A
+ok

@@ -1,0 +1,66 @@
+######## 3.53.4 2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc
+== IN, one element (observed: abc, ABC)
+abc
+ABC
+== IN, the same element twice (observed: ABC)
+ABC
+== NOT IN, one element (observed: x)
+x
+== NOT IN, twice (observed: abc, x)
+abc
+x
+== scalar: one element, twice, one element plus another value (observed: 1|0|0)
+1|0|0
+== non-constant element: not rewritten, uses c's collation (observed: 0|0)
+0|0
+== constant expression element: rewritten (observed: 1|0)
+1|0
+== explicit COLLATE on the left wins in both forms (observed: 0)
+0
+== subquery form, documented to behave like x = y (not part of the report) (observed: 1)
+1
+######## 3.54.0 2026-10-06 18:52:47 a435d786fe0e245e352d08d2e2ddf8c1e15154809e3b471810cc327e9d90ef85
+== IN, one element (observed: abc, ABC)
+abc
+ABC
+== IN, the same element twice (observed: ABC)
+ABC
+== NOT IN, one element (observed: x)
+x
+== NOT IN, twice (observed: abc, x)
+abc
+x
+== scalar: one element, twice, one element plus another value (observed: 1|0|0)
+1|0|0
+== non-constant element: not rewritten, uses c's collation (observed: 0|0)
+0|0
+== constant expression element: rewritten (observed: 1|0)
+1|0
+== explicit COLLATE on the left wins in both forms (observed: 0)
+0
+== subquery form, documented to behave like x = y (not part of the report) (observed: 1)
+1
+######## python sqlite3 module, SQLite 3.51.0 (key queries)
+== IN, one element: abc, ABC
+== IN, the same element twice: ABC
+== NOT IN, one element: x
+== NOT IN, twice: abc, x
+--- src/parse.y (trunk 9f05c6e) ---
+    }else{
+      Expr *pRHS = Y->a[0].pExpr;
+      if( Y->nExpr==1 && sqlite3ExprIsConstant(pParse,pRHS) && A->op!=TK_VECTOR ){
+        Y->a[0].pExpr = 0;
+        sqlite3ExprListDelete(pParse->db, Y);
+        pRHS = sqlite3PExpr(pParse, TK_UPLUS, pRHS, 0);
+        A = sqlite3PExpr(pParse, TK_EQ, A, pRHS);
+      }else if( Y->nExpr==1 && pRHS->op==TK_SELECT ){
+--- src/expr.c sqlite3ExprCollSeq ---
+        const char *zColl = sqlite3ColumnColl(&p->y.pTab->aCol[j]);
+        pColl = sqlite3FindCollSeq(db, ENC(db), zColl, 0);
+      }
+      break;
+    }
+    if( op==TK_CAST || op==TK_UPLUS ){
+      p = p->pLeft;
+      continue;
+    }

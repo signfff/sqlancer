@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<title>Contentless FTS4 Bug Report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&family=Source+Serif+4:opsz,wght@8..60,600&display=swap">
+<style>
+/* Layout: one reading column; bilingual pairs sit side by side (EN | 中) and stack on phones. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --fg: #1b2330;
+  --muted: #5b6676;
+  --line: #d9dee6;
+  --accent: #1f5f8b;
+  --accent-soft: #e5eef5;
+  --code-bg: #eef1f5;
+  --bad: #a33a2a;
+  --bad-soft: #f7e6e2;
+  --good: #2f6f3e;
+  --good-soft: #e3f0e6;
+  --font-display: "Source Serif 4", Georgia, "Noto Serif SC", serif;
+  --font-body: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-zh: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161c; --surface: #1a2029; --fg: #e3e8ef; --muted: #9aa5b4; --line: #2c3540;
+    --accent: #7fb6dd; --accent-soft: #1d2f3e; --code-bg: #212833;
+    --bad: #f0947f; --bad-soft: #3a2420; --good: #8fd19e; --good-soft: #1f3324;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12161c; --surface: #1a2029; --fg: #e3e8ef; --muted: #9aa5b4; --line: #2c3540;
+  --accent: #7fb6dd; --accent-soft: #1d2f3e; --code-bg: #212833;
+  --bad: #f0947f; --bad-soft: #3a2420; --good: #8fd19e; --good-soft: #1f3324;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-body); font-size: 15px; line-height: 1.6;
+  padding-inline: 16px; padding-block: 32px 64px;
+}
+.wrap { max-width: 1040px; margin: 0 auto; display: grid; gap: 40px; }
+h1, h2 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(26px, 4vw, 36px); line-height: 1.2; }
+h2 { font-size: 22px; line-height: 1.3; }
+h3 { font-size: 15px; margin: 0; font-weight: 600; }
+p { margin: 0; }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code, pre, .mono { font-family: var(--font-mono); font-size: 13px; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 6px; margin: 0; overflow-x: auto; line-height: 1.5; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+header { display: grid; gap: 12px; }
+.lede { color: var(--muted); max-width: 70ch; }
+.facts { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); }
+.chip.bad { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+.chip.good { color: var(--good); background: var(--good-soft); border-color: transparent; }
+
+section { display: grid; gap: 16px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 20px; display: grid; gap: 16px; min-width: 0; }
+
+/* where to post */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; counter-reset: s; }
+.steps li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; align-items: start; }
+.steps li::before { counter-increment: s; content: counter(s); width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 600; font-size: 13px; display: grid; place-items: center; margin-top: 1px; }
+.steps li > div { min-width: 0; display: grid; gap: 4px; }
+.url { font-family: var(--font-mono); font-size: 14px; word-break: break-all; }
+.note { font-size: 13px; color: var(--muted); }
+
+/* copy block */
+.copyrow { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.copyrow h3 { font-size: 14px; }
+button.copy { font: inherit; font-size: 13px; font-weight: 500; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--surface); cursor: pointer; }
+button.copy:hover { filter: brightness(1.08); }
+button.copy[data-done] { background: var(--surface); color: var(--accent); }
+.titlebox { font-family: var(--font-mono); font-size: 14px; background: var(--code-bg); padding: 10px 14px; border-radius: 6px; overflow-wrap: anywhere; }
+pre.post { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* bilingual pairs */
+.pair { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); }
+.pair:first-of-type { border-top: 0; }
+.pair > div { padding: 14px 0; min-width: 0; display: grid; gap: 8px; align-content: start; }
+.pair > .en { padding-right: 20px; }
+.pair > .zh { padding-left: 20px; border-left: 1px solid var(--line); font-family: var(--font-zh); }
+.pair .tag { font-size: 11px; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; }
+.pairhead { display: grid; grid-template-columns: 1fr 1fr; font-size: 12px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; padding-bottom: 6px; border-bottom: 2px solid var(--accent); }
+.pairhead span:last-child { padding-left: 20px; }
+@media (max-width: 720px) {
+  .pair, .pairhead { grid-template-columns: 1fr; }
+  .pairhead span:last-child { display: none; }
+  .pair > .en { padding-right: 0; padding-bottom: 4px; }
+  .pair > .zh { padding-left: 12px; border-left: 2px solid var(--accent-soft); padding-top: 4px; margin-bottom: 12px; }
+}
+
+/* version matrix */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; color: var(--muted); font-weight: 500; letter-spacing: .04em; }
+td.v { font-family: var(--font-mono); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.res { font-family: var(--font-mono); font-size: 12.5px; padding: 1px 8px; border-radius: 4px; white-space: nowrap; }
+.res.ok { color: var(--good); background: var(--good-soft); }
+.res.err { color: var(--bad); background: var(--bad-soft); }
+.envgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 24px; }
+.envgrid div { display: grid; gap: 2px; min-width: 0; }
+.envgrid dt { font-size: 12px; color: var(--muted); }
+.envgrid dd { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">SQLite 缺陷报告 · Bug report draft</span>
+  <h1>PRAGMA integrity_check fails on every contentless FTS4 table since 3.44.0</h1>
+  <p class="lede">无内容 FTS4 表（<code>content=''</code>）自 3.44.0 起在 <code>PRAGMA integrity_check</code> 中必然报错，即使是从未写入过的空表。3.43.2 对同一个数据库返回 <code>ok</code>。最新 trunk（2026-10-01）仍可复现。</p>
+  <div class="facts">
+    <span class="chip">3.43.2 <span class="res ok">ok</span></span>
+    <span class="chip bad">3.44.0 起报错</span>
+    <span class="chip bad">trunk 99aab2c992 仍在</span>
+    <span class="chip good">同类只读问题已修：b855886c4c</span>
+  </div>
+</header>
+
+<section aria-labelledby="where">
+  <h2 id="where">发在哪里、怎么发</h2>
+  <div class="panel">
+    <ol class="steps">
+      <li><div>
+        <h3>打开 SQLite Bug 论坛的发帖页</h3>
+        <span class="url">https://sqlite.org/bugs/forumnew</span>
+        <p class="note">这是官方专门收 bug 的论坛（列表页 <span class="mono">sqlite.org/bugs/forum</span>）。最近的 bug 报告都发在这里，不要发到普通用户论坛 <span class="mono">sqlite.org/forum</span>。SQLite 不接受 GitHub issue，GitHub 上的仓库只是镜像。</p>
+      </div></li>
+      <li><div>
+        <h3>选择发帖身份</h3>
+        <p>页面会给三个选项：匿名发帖（Post to the forum anonymously）、注册新账号后发帖、登录已有账号。</p>
+        <p class="note">建议注册一个账号：开发者回复后你能收到通知，也方便后续补充信息。匿名帖在 Fossil 论坛上一般要等版主审核才会显示，这一点我没有实际验证过。</p>
+      </div></li>
+      <li><div>
+        <h3>填写标题和正文</h3>
+        <p>把下面"英文发帖稿"里的标题和正文分别复制进去。正文格式选 <b>Markdown</b>，这样代码块会正确显示。先点预览（Preview）检查一下，再提交。</p>
+      </div></li>
+      <li><div>
+        <h3>发出后留意回复</h3>
+        <p>开发者通常会在帖子里回复，修复后会贴出 check-in 链接。如果被要求提供更多信息，可以引用本页最后的"测试环境"部分。</p>
+      </div></li>
+    </ol>
+  </div>
+</section>
+
+<section aria-labelledby="post">
+  <h2 id="post">英文发帖稿（直接复制）</h2>
+  <div class="panel">
+    <div class="copyrow">
+      <h3>标题 · Subject</h3>
+      <button class="copy" type="button" data-target="post-title">复制标题</button>
+    </div>
+    <div class="titlebox" id="post-title">PRAGMA integrity_check fails on every contentless FTS4 table since 3.44.0</div>
+    <div class="copyrow">
+      <h3>正文 · Body（Markdown）</h3>
+      <button class="copy" type="button" data-target="post-body">复制正文</button>
+    </div>
+<pre class="post" id="post-body">Since 3.44.0, `PRAGMA integrity_check` and `PRAGMA quick_check` report an error for every contentless FTS4 table, even an empty one that has never been written to. 3.43.2 reports "ok" for the same database.
+
+```
+CREATE VIRTUAL TABLE a USING fts4(x, content='');
+PRAGMA integrity_check;
+-- 3.43.2:          ok
+-- 3.44.0 .. trunk: unable to validate the inverted index for FTS4 table main.a: SQL logic error
+```
+
+A database file created and checked with 3.43.2 ("ok") fails integrity_check as soon as it is opened with 3.44.0 or later, with no change to the file. MATCH queries on it keep working.
+
+Controls, all "ok" on every version tested: an ordinary FTS4 table, an external-content FTS4 table over a real table (`content='src'`), and a contentless FTS5 table (`content=''`).
+
+fts3IntegrityMethod(), added with xIntegrity in 3.44.0, calls sqlite3Fts3IntegrityCheck(), which prepares `SELECT <zReadExprlist>` against the content table. A contentless table has no content table, and the resulting SQLITE_ERROR is reported as an integrity problem. The FTS4 'integrity-check' command (`INSERT INTO a(a) VALUES('integrity-check')`) fails the same way, and did so before 3.44.0, but it only runs when asked for. FTS5 skips the content comparison for contentless tables and returns "ok".
+
+Section 6.2.1 of the FTS3/FTS4 documentation lists the operations contentless tables do not support, and integrity checking is not among them. The virtual table documentation says xIntegrity reports problems with the content of the table, and the content here is fine.
+
+This looks like a sibling of the read-only case fixed in b855886c4c ("Ensure xIntegrity methods of fts3/fts5 work on read-only databases"): another healthy FTS4 configuration that the 3.44.0 xIntegrity method does not handle.
+
+Versions tested:
+
+- 3.43.2 2023-10-10 4310099cce: ok
+- 3.44.0 2023-11-01 17129ba1ff: error
+- 3.53.4 2026-07-24 bf7c7f3003: error
+- 3.54.0 trunk 2026-10-01 16:48:03 99aab2c992: error</pre>
+    <p class="note">复制按钮不可用时，可以直接在上面的框里选中文字复制。</p>
+  </div>
+</section>
+
+<section aria-labelledby="bi">
+  <h2 id="bi">中英逐段对照</h2>
+  <div class="panel">
+    <div class="pairhead"><span>English (posted)</span><span>中文（对照理解用，不要发）</span></div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Summary</span><p>Since 3.44.0, <code>PRAGMA integrity_check</code> and <code>PRAGMA quick_check</code> report an error for every contentless FTS4 table, even an empty one that has never been written to. 3.43.2 reports "ok" for the same database.</p></div>
+      <div class="zh"><span class="tag">概述</span><p>从 3.44.0 开始，<code>PRAGMA integrity_check</code> 和 <code>PRAGMA quick_check</code> 对每一张无内容 FTS4 表都会报错，即使是一张从未写入过的空表。同一个数据库在 3.43.2 上返回 "ok"。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Reproducer</span>
+<pre>CREATE VIRTUAL TABLE a USING fts4(x, content='');
+PRAGMA integrity_check;
+-- 3.43.2:          ok
+-- 3.44.0 .. trunk: unable to validate the
+--   inverted index for FTS4 table main.a:
+--   SQL logic error</pre></div>
+      <div class="zh"><span class="tag">复现</span><p>建一张无内容 FTS4 表（<code>content=''</code> 表示只存倒排索引、不存原文），然后体检。3.43.2 返回 ok；3.44.0 到最新 trunk 都报"无法验证 FTS4 表 main.a 的倒排索引：SQL logic error"。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Upgrade</span><p>A database file created and checked with 3.43.2 ("ok") fails integrity_check as soon as it is opened with 3.44.0 or later, with no change to the file. MATCH queries on it keep working.</p></div>
+      <div class="zh"><span class="tag">升级场景</span><p>用 3.43.2 创建并体检通过（ok）的数据库文件，一旦用 3.44.0 或更新版本打开，体检就失败，而文件本身没有任何改动。在这个库上做 MATCH 全文检索仍然正常。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Controls</span><p>Controls, all "ok" on every version tested: an ordinary FTS4 table, an external-content FTS4 table over a real table (<code>content='src'</code>), and a contentless FTS5 table (<code>content=''</code>).</p></div>
+      <div class="zh"><span class="tag">对照组</span><p>以下三种表在所有测试版本上体检都是 ok：普通 FTS4 表；以一张真实表为外部内容的 FTS4 表（<code>content='src'</code>）；无内容 FTS5 表（<code>content=''</code>）。这说明问题只出在"无内容 + FTS4"这个组合上。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Cause</span><p>fts3IntegrityMethod(), added with xIntegrity in 3.44.0, calls sqlite3Fts3IntegrityCheck(), which prepares <code>SELECT &lt;zReadExprlist&gt;</code> against the content table. A contentless table has no content table, and the resulting SQLITE_ERROR is reported as an integrity problem. The FTS4 'integrity-check' command (<code>INSERT INTO a(a) VALUES('integrity-check')</code>) fails the same way, and did so before 3.44.0, but it only runs when asked for. FTS5 skips the content comparison for contentless tables and returns "ok".</p></div>
+      <div class="zh"><span class="tag">原因</span><p>3.44.0 随 xIntegrity 接口加入的 fts3IntegrityMethod() 会调用 sqlite3Fts3IntegrityCheck()，后者要对内容表执行 <code>SELECT …</code>，把原文重新分词后和倒排索引比对。无内容表没有内容表，这一步失败产生的 SQLITE_ERROR 被当成了体检问题上报。FTS4 自带的 'integrity-check' 命令也以同样方式失败，3.44.0 之前就是这样，但它只在用户主动执行时才会运行。FTS5 遇到无内容表会跳过与原文的比对，所以返回 ok。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Docs</span><p>Section 6.2.1 of the FTS3/FTS4 documentation lists the operations contentless tables do not support, and integrity checking is not among them. The virtual table documentation says xIntegrity reports problems with the content of the table, and the content here is fine.</p></div>
+      <div class="zh"><span class="tag">文档依据</span><p>FTS3/FTS4 文档 6.2.1 节逐条列出了无内容表不支持的操作（UPDATE、DELETE、读取原文列、snippet、offsets），完整性检查不在其中。虚拟表接口文档规定 xIntegrity 用来报告表内容的问题，而这里的内容并没有问题。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Precedent</span><p>This looks like a sibling of the read-only case fixed in b855886c4c ("Ensure xIntegrity methods of fts3/fts5 work on read-only databases"): another healthy FTS4 configuration that the 3.44.0 xIntegrity method does not handle.</p></div>
+      <div class="zh"><span class="tag">先例</span><p>这和已在 b855886c4c 修复的只读库问题（"确保 fts3/fts5 的 xIntegrity 在只读数据库上可用"）属于同一类：都是 3.44.0 的 xIntegrity 没有照顾到的一种健康 FTS4 用法。那个问题在论坛报告当天就修复了，并回补到了 3.45 分支。</p></div>
+    </div>
+
+    <div class="pair">
+      <div class="en"><span class="tag">Versions</span><p>Versions tested: 3.43.2 2023-10-10 4310099cce: ok · 3.44.0 2023-11-01 17129ba1ff: error · 3.53.4 2026-07-24 bf7c7f3003: error · 3.54.0 trunk 2026-10-01 16:48:03 99aab2c992: error</p></div>
+      <div class="zh"><span class="tag">测试版本</span><p>3.43.2：ok；3.44.0：报错；3.53.4：报错；3.54.0 trunk（2026-10-01 16:48:03，99aab2c992）：报错。每个版本后面是官方的 check-in 号前缀，开发者可以据此定位源码版本。</p></div>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="matrix">
+  <h2 id="matrix">验证结果 · Verification matrix</h2>
+  <div class="panel">
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>用例 Case</th><th>3.43.2</th><th>3.44.0</th><th>3.53.4</th><th>trunk 10-01</th></tr></thead>
+        <tbody>
+          <tr><td>A 空的无内容 FTS4，integrity_check / quick_check</td><td><span class="res ok">ok</span></td><td><span class="res err">error</span></td><td><span class="res err">error</span></td><td><span class="res err">error</span></td></tr>
+          <tr><td>B 写入一行后 integrity_check（MATCH 正常返回）</td><td><span class="res ok">ok</span></td><td><span class="res err">error</span></td><td><span class="res err">error</span></td><td><span class="res err">error</span></td></tr>
+          <tr><td>C FTS4 自带 'integrity-check' 命令</td><td><span class="res err">error</span></td><td><span class="res err">error</span></td><td><span class="res err">error</span></td><td><span class="res err">error</span></td></tr>
+          <tr><td>D 对照：普通 FTS4</td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td></tr>
+          <tr><td>E 对照：外部内容 FTS4</td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td></tr>
+          <tr><td>F 对照：无内容 FTS5</td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td><td><span class="res ok">ok</span></td></tr>
+          <tr><td>升级：3.43.2 建库，新版本打开同一文件</td><td><span class="res ok">ok</span></td><td><span class="res err">error</span></td><td>未单独测</td><td><span class="res err">error</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">C 在 3.43.2 上也报错，说明命令本身的局限早已存在；3.44.0 把它接进了 PRAGMA integrity_check，才让每次体检都撞上它。</p>
+  </div>
+</section>
+
+<section aria-labelledby="env">
+  <h2 id="env">测试环境 · Environment</h2>
+  <div class="panel">
+    <dl class="envgrid">
+      <div><dt>最新 trunk</dt><dd class="mono">3.54.0 · 2026-10-01 16:48:03 · 99aab2c99220a381…</dd><dd>GitHub 官方镜像 github.com/sqlite/sqlite，WSL Ubuntu 22.04，gcc 11.4，<code>./configure --enable-all</code></dd></div>
+      <div><dt>被测发布版</dt><dd class="mono">3.53.4 · 2026-07-24 19:02:57 · bf7c7f3003…</dd><dd>Windows 原生，TDM-GCC，编译选项与 sqlite-jdbc 对齐</dd></div>
+      <div><dt>旧版本</dt><dd class="mono">3.43.2 · 4310099cce / 3.44.0 · 17129ba1ff</dd><dd>官网合并版源码（sqlite.org/2023/sqlite-amalgamation-*.zip），TDM-GCC，<code>-DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_FTS5</code></dd></div>
+      <div><dt>系统</dt><dd>Windows 11 + WSL2 Ubuntu 22.04</dd></div>
+      <div><dt>查重</dt><dd>论坛 4 组关键词、源码时间线 "contentless"（29 个提交）与 "xIntegrity"（15 个提交）、3.44.0 发布说明、FTS3/PRAGMA/虚拟表文档：均未提及此问题。</dd></div>
+      <div><dt>如何发现</dt><dd>EGRAPH/SQLancer 长跑会建无内容 FTS4 表；调查一次数据库损坏时做体检，在每个库里都看到这条报错。</dd></div>
+    </dl>
+  </div>
+</section>
+
+</div>
+
+<script>
+document.querySelectorAll("button.copy").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var el = document.getElementById(btn.getAttribute("data-target"));
+    var text = el.textContent;
+    var label = btn.textContent;
+    function done(msg) {
+      btn.textContent = msg;
+      btn.setAttribute("data-done", "");
+      setTimeout(function () { btn.textContent = label; btn.removeAttribute("data-done"); }, 1800);
+    }
+    function selectFallback() {
+      var r = document.createRange();
+      r.selectNodeContents(el);
+      var s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      done("已选中，按 Ctrl+C");
+    }
+    try {
+      navigator.clipboard.writeText(text).then(function () { done("已复制"); }, selectFallback);
+    } catch (e) {
+      selectFallback();
+    }
+  });
+});
+</script>
+
+</body>
+</html>

@@ -45,3 +45,5 @@ This looks like the situation check-in 2ff3b25f40 / 2ea4a9f75f (2014-03-20, tick
 Seen on 3.51.0, 3.53.4 and trunk (2026-10-06 18:52:47 a435d786fe0e245e352d08d2e2ddf8c1e15154809e3b471810cc327e9d90ef85).
 
 (`x IN (SELECT y ...)` is documented to behave like `x = y`, so the subquery form is not part of this report.)
+
+It happens only when the single element is a constant: with a non-constant element, `c IN (d COLLATE NOCASE)` on a row ('abc','ABC') gives 0, like the two-element list. That points at the rewrite in parse.y (trunk 9f05c6e, around line 1521): `x IN (constant)` becomes `x = +constant`, and sqlite3ExprCollSeq() looks through TK_UPLUS, so the explicit COLLATE on the constant becomes the right-hand explicit collation of `=` and wins over the left operand's column collation. An explicit COLLATE on the left operand still wins (`(c COLLATE BINARY) IN ('ABC' COLLATE NOCASE)` is 0). EP_Generic, which the 2014 check-in used to block this, no longer appears in the source.
