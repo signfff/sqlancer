@@ -9,3 +9,5 @@ sub-antisym ; (- ?x ?y) => (neg (- ?y ?x))
 double-neg ; (not (not ?x)) => ?x
 # The swap rules without the server's collation guard: unsound for two columns of different collation.
 eq-sym-unguarded ; (= ?x ?y) => (= ?y ?x)
+# Unary plus drops a column's affinity (reverted 2026-09-19 after four false positives).
+uplus-intro ; ?x => (uplus ?x)

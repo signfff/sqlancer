@@ -54,7 +54,10 @@ VALUE_OPS = {"+", "-", "*", "/", "rem", "concat", "bitand", "bitor", "neg", "bit
              "coalesce", "ifnull", "nullif", "cast_int", "cast_real", "cast_text", "cast_numeric"}
 
 # Context around a value-producing side: (template, operand) with {e} for the side.
-COMPARISON_PARTNERS = ["'ABC'", "'abc '", "1", "w.c_text", "w.c_nocase"]
+# Numeric-looking text and typed columns expose affinity: a column carries its affinity into a
+# comparison and an expression over it does not (c_int = '1' is 1, (+c_int) = '1' is 0).
+COMPARISON_PARTNERS = ["'ABC'", "'abc '", "1", "'1'", "'1.0'", "x'31'", "w.c_text", "w.c_nocase", "w.c_int",
+                       "w.c_real"]
 COMPARISON_TEMPLATES = ["(({e}) = {w})", "({w} = ({e}))", "(({e}) < {w})", "({w} < ({e}))"]
 
 
@@ -114,7 +117,8 @@ def to_sql(tree, binding):
 
 
 def produces_value(tree):
-    return not isinstance(tree, str) and tree[0] in VALUE_OPS
+    # A bare variable can be a column, which brings its affinity and collation to the comparison.
+    return isinstance(tree, str) or tree[0] in VALUE_OPS
 
 
 def options():
