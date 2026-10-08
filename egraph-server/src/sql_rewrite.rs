@@ -58,6 +58,13 @@ pub enum SqlLang {
     Case([Id; 3]),      // CASE WHEN c THEN a ELSE b END (searched, one WHEN); also iif(c, a, b)
     Coalesce([Id; 2]),  // coalesce(a, b) and ifnull(a, b), which SQLite implements alike
     Nullif([Id; 2]),    // nullif(a, b)
+    // CAST(x AS type), one node per affinity the type name gives (SQLite's rules in datatype3.html):
+    // the result carries that affinity, and a column's collation travels through it.
+    CastInt([Id; 1]),
+    CastReal([Id; 1]),
+    CastText([Id; 1]),
+    CastNumeric([Id; 1]),
+    CastBlob([Id; 1]),
     Symbol(u64),
 }
 
@@ -99,6 +106,11 @@ impl Language for SqlLang {
             SqlLang::Case(c) => c,
             SqlLang::Coalesce(c) => c,
             SqlLang::Nullif(c) => c,
+            SqlLang::CastInt(c) => c,
+            SqlLang::CastReal(c) => c,
+            SqlLang::CastText(c) => c,
+            SqlLang::CastNumeric(c) => c,
+            SqlLang::CastBlob(c) => c,
             SqlLang::Symbol(_) => &[],
         }
     }
@@ -136,6 +148,11 @@ impl Language for SqlLang {
             SqlLang::Case(c) => c,
             SqlLang::Coalesce(c) => c,
             SqlLang::Nullif(c) => c,
+            SqlLang::CastInt(c) => c,
+            SqlLang::CastReal(c) => c,
+            SqlLang::CastText(c) => c,
+            SqlLang::CastNumeric(c) => c,
+            SqlLang::CastBlob(c) => c,
             SqlLang::Symbol(_) => &mut [],
         }
     }
@@ -326,6 +343,36 @@ impl FromOp for SqlLang {
                     .map_err(|_| format!("nullif: expected 2 children"))?;
                 Ok(SqlLang::Nullif(arr))
             }
+            "cast_int" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("cast_int: expected 1 child"))?;
+                Ok(SqlLang::CastInt(arr))
+            }
+            "cast_real" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("cast_real: expected 1 child"))?;
+                Ok(SqlLang::CastReal(arr))
+            }
+            "cast_text" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("cast_text: expected 1 child"))?;
+                Ok(SqlLang::CastText(arr))
+            }
+            "cast_numeric" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("cast_numeric: expected 1 child"))?;
+                Ok(SqlLang::CastNumeric(arr))
+            }
+            "cast_blob" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("cast_blob: expected 1 child"))?;
+                Ok(SqlLang::CastBlob(arr))
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -376,6 +423,11 @@ impl fmt::Display for SqlLang {
             SqlLang::Case(_) => write!(f, "case"),
             SqlLang::Coalesce(_) => write!(f, "coalesce"),
             SqlLang::Nullif(_) => write!(f, "nullif"),
+            SqlLang::CastInt(_) => write!(f, "cast_int"),
+            SqlLang::CastReal(_) => write!(f, "cast_real"),
+            SqlLang::CastText(_) => write!(f, "cast_text"),
+            SqlLang::CastNumeric(_) => write!(f, "cast_numeric"),
+            SqlLang::CastBlob(_) => write!(f, "cast_blob"),
             SqlLang::Symbol(k) => write!(f, "{}", k),
         }
     }
@@ -650,6 +702,24 @@ fn sql_expr_to_recexpr_impl(
             }
         }
 
+        // CAST(x AS type): plain CAST only (not TRY_CAST or ::), no FORMAT.
+        SqlExpr::Cast {
+            kind: sqlparser::ast::CastKind::Cast,
+            expr: inner,
+            data_type,
+            array: false,
+            format: None,
+        } => {
+            let child = sql_expr_to_recexpr_impl(inner, rec, symbols, counter, dedup, source_sql);
+            rec.add(match cast_affinity(&data_type.to_string()) {
+                "INTEGER" => SqlLang::CastInt([child]),
+                "REAL" => SqlLang::CastReal([child]),
+                "TEXT" => SqlLang::CastText([child]),
+                "BLOB" => SqlLang::CastBlob([child]),
+                _ => SqlLang::CastNumeric([child]),
+            })
+        }
+
         // A searched CASE with one WHEN. A missing ELSE is ELSE NULL. More WHENs, and the simple
         // form CASE x WHEN ..., stay one opaque atom.
         SqlExpr::Case {
@@ -852,6 +922,33 @@ fn plain_call_args(f: &sqlparser::ast::Function) -> Option<Vec<&SqlExpr>> {
             _ => None,
         })
         .collect()
+}
+
+/// The affinity SQLite gives a CAST target, from its declared type name (datatype3.html 3.1).
+fn cast_affinity(type_name: &str) -> &'static str {
+    let t = type_name.to_ascii_uppercase();
+    if t.contains("INT") {
+        "INTEGER"
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        "TEXT"
+    } else if t.contains("BLOB") || t.trim().is_empty() {
+        "BLOB"
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        "REAL"
+    } else {
+        "NUMERIC"
+    }
+}
+
+fn cast_to(inner: SqlExpr, type_name: &str) -> SqlExpr {
+    use sqlparser::ast::{CastKind, DataType, ObjectName};
+    SqlExpr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(inner),
+        data_type: DataType::Custom(ObjectName::from(vec![Ident::new(type_name)]), Vec::new()),
+        array: false,
+        format: None,
+    }
 }
 
 fn call(name: &str, args: Vec<SqlExpr>) -> SqlExpr {
@@ -1064,6 +1161,11 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
             Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
             Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
         ),
+        SqlLang::CastInt([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "INTEGER"),
+        SqlLang::CastReal([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "REAL"),
+        SqlLang::CastText([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "TEXT"),
+        SqlLang::CastNumeric([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "NUMERIC"),
+        SqlLang::CastBlob([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "BLOB"),
         SqlLang::Coalesce([a, b]) => call("coalesce", vec![
             recexpr_to_sql_expr_impl(expr, *a, symbols),
             recexpr_to_sql_expr_impl(expr, *b, symbols),
@@ -1741,6 +1843,11 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::Case(_) => SqlLang::Case([child_ids[0], child_ids[1], child_ids[2]]),
         SqlLang::Coalesce(_) => SqlLang::Coalesce([child_ids[0], child_ids[1]]),
         SqlLang::Nullif(_) => SqlLang::Nullif([child_ids[0], child_ids[1]]),
+        SqlLang::CastInt(_) => SqlLang::CastInt([child_ids[0]]),
+        SqlLang::CastReal(_) => SqlLang::CastReal([child_ids[0]]),
+        SqlLang::CastText(_) => SqlLang::CastText([child_ids[0]]),
+        SqlLang::CastNumeric(_) => SqlLang::CastNumeric([child_ids[0]]),
+        SqlLang::CastBlob(_) => SqlLang::CastBlob([child_ids[0]]),
         SqlLang::Symbol(k) => SqlLang::Symbol(*k),
     }
 }
@@ -1860,6 +1967,23 @@ fn eval(
         SqlLang::NotEq([l, r]) => order_compare(expr, *l, *r, symbols, assignment, |o| {
             o != std::cmp::Ordering::Equal
         }),
+        // Approximate - this evaluator has no REAL, so REAL and NUMERIC are taken as INTEGER. It only
+        // backs up validation of joins; the rules over these nodes are checked against SQLite itself.
+        SqlLang::CastInt([x]) | SqlLang::CastReal([x]) | SqlLang::CastNumeric([x]) => {
+            match eval(expr, *x, symbols, assignment) {
+                SqlValue::Null => SqlValue::Null,
+                v => sqlvalue_to_int(&v).map_or(SqlValue::Null, SqlValue::Int),
+            }
+        }
+        SqlLang::CastText([x]) => match eval(expr, *x, symbols, assignment) {
+            SqlValue::Null => SqlValue::Null,
+            v => SqlValue::Text(sqlvalue_to_text(&v)),
+        },
+        SqlLang::CastBlob([x]) => match eval(expr, *x, symbols, assignment) {
+            SqlValue::Null => SqlValue::Null,
+            SqlValue::Blob(b) => SqlValue::Blob(b),
+            v => SqlValue::Blob(sqlvalue_to_text(&v).into_bytes()),
+        },
         SqlLang::Coalesce([a, b]) => match eval(expr, *a, symbols, assignment) {
             SqlValue::Null => eval(expr, *b, symbols, assignment),
             v => v,

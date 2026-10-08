@@ -1,0 +1,69 @@
+# Candidate rules involving coalesce / nullif (agent1, round 4). Nothing here has been run yet: every rule should go through rulegate.
+# Facts and assumptions used throughout:
+#   - coalesce(a,b) returns a if a is non-NULL, otherwise b. The result has no affinity and no implicit collation.
+#   - nullif(a,b) is NULL if a=b, otherwise a. It compares WITHOUT affinity, using the collation of the first argument that has one (implicit column collation included).
+#     I never take nullif's comparison apart. Every nullif rule keeps (nullif ?a ?b) intact as a unit, so its internal comparison is unchanged.
+#   - CASE results also have no affinity, so coalesce <-> case keeps affinity. None of the rules replaces a function call by a bare argument
+#     in value position, except where the argument is a 0/1 integer that is never NULL (rules 17-19). Integer vs anything compares the same with or without affinity/collation.
+#   - Explicit-COLLATE risk: when a function or CASE result is compared, I believe the collation comes from the first explicitly collated sub-expression in argument order.
+#     Rules that change that order are marked RISKY. Rules whose result is an integer (NOT, &, |, ~, IS TRUE…) are unaffected.
+#   - Rules that use a variable twice change results when it is non-deterministic, as before.
+
+coalesce-assoc ; (coalesce (coalesce ?a ?b) ?c) => (coalesce ?a (coalesce ?b ?c))
+#   Both return the first non-NULL of a,b,c with no affinity. The argument order a,b,c is kept, so the explicit-collation search order is the same. Sound in both directions.
+coalesce-to-case ; (coalesce ?a ?b) => (case (isnotnull ?a) ?a ?b)
+#   Same value. Neither form has affinity or implicit collation. The explicit-collation order (a,a,b) vs (a,b) has the same first hit.
+#   SLIGHTLY UNSURE: this assumes the CASE condition isnotnull(a) passes a's explicit COLLATE on in the same way that a itself does.
+case-isnull-to-coalesce ; (case (isnull ?a) ?b ?a) => (coalesce ?a ?b)
+#   a NULL gives b, otherwise a. The explicit-collation order is a,b,a vs a,b, so the first hit is the same. Sound in both directions. It carries the same slight uncertainty as coalesce-to-case.
+isnotnull-coalesce ; (isnotnull (coalesce ?a ?b)) => (or (isnotnull ?a) (isnotnull ?b))
+#   The result is non-NULL iff either argument is. Both sides are 0/1. This may be derivable from isnull-coalesce plus not-isnull and De Morgan; drop it if the reachability check says so.
+istrue-coalesce ; (istrue (coalesce ?a ?b)) => (or (istrue ?a) (and (isnull ?a) (istrue ?b)))
+#   a non-NULL gives the truth of a, OR 0. a NULL gives 0 OR the truth of b. Both sides are 0/1.
+isfalse-coalesce ; (isfalse (coalesce ?a ?b)) => (or (isfalse ?a) (and (isnull ?a) (isfalse ?b)))
+#   Same argument for falsity.
+istrue-coalesce-case ; (istrue (coalesce ?a ?b)) => (case (isnull ?a) (istrue ?b) (istrue ?a))
+#   It picks the truth test of the argument coalesce would return. The branches are 0/1 integers, so collation and affinity do not matter.
+not-into-coalesce ; (not (coalesce ?a ?b)) => (coalesce (not ?a) (not ?b))
+#   NOT a is NULL iff a is NULL, so coalesce falls through on exactly the same rows. The results are 0/1/NULL integers. Sound in both directions.
+neg-into-coalesce ; (neg (coalesce ?a ?b)) => (coalesce (neg ?a) (neg ?b))
+#   -a is NULL iff a is NULL: TEXT/BLOB become numbers, -MIN becomes a REAL, and NaN cannot occur. The value is the same.
+#   SLIGHTLY UNSURE: a TEXT result keeps the same value, but if the result is compared to TEXT, the explicit-collation order changes only in an irrelevant way, because neg's result is numeric.
+bitnot-into-coalesce ; (bitnot (coalesce ?a ?b)) => (coalesce (bitnot ?a) (bitnot ?b))
+#   ~a is NULL iff a is NULL, and the result is an integer.
+bitand-into-coalesce ; (bitand (coalesce ?a ?b) ?c) => (coalesce (bitand ?a ?c) (bitand ?b ?c))
+#   c NULL gives NULL on both sides. Otherwise a&c is non-NULL iff a is, so the same argument is chosen. The result is an integer, so collation does not matter.
+bitor-into-coalesce ; (bitor (coalesce ?a ?b) ?c) => (coalesce (bitor ?a ?c) (bitor ?b ?c))
+#   Same argument as for &.
+concat-into-coalesce ; (concat (coalesce ?a ?b) ?c) => (coalesce (concat ?a ?c) (concat ?b ?c))
+#   c NULL gives NULL on both sides. Otherwise a||c is non-NULL iff a is, and an oversized result raises an error on both sides. The values are identical.
+#   RISKY for collation only: the explicit-COLLATE order a,b,c becomes a,c,b,c. That matters only if b and c both carry different explicit COLLATEs and a has none, and the result is compared as TEXT.
+#   Do NOT generalise this to + - * /: Inf + -Inf is NaN, which becomes NULL, so a+c can be NULL with a non-NULL and the fallback changes.
+coalesce-dup-inner ; (coalesce ?a (coalesce ?a ?b)) => (coalesce ?a ?b)
+#   If a is NULL, the inner coalesce also falls through to b. The explicit-collation order a,a,b vs a,b has the same first hit.
+coalesce-absorb-tail ; (coalesce (coalesce ?a ?b) ?a) => (coalesce ?a ?b)
+#   The trailing a is reached only when a and b are both NULL, so it yields NULL, as coalesce(a,b) does. The order a,b,a vs a,b has the same first hit.
+coalesce-dead-fallback-isnull ; (coalesce (isnull ?a) ?b) => (isnull ?a)
+#   ISNULL is never NULL, so b is never used. Both results are 0/1 integers without affinity, and collation does not affect integer comparisons. The same rule works for isnotnull.
+coalesce-dead-fallback-istrue ; (coalesce (istrue ?a) ?b) => (istrue ?a)
+#   Same argument. The same rule works for isfalse/isnottrue/isnotfalse.
+coalesce-dead-fallback-is ; (coalesce (is ?x ?y) ?b) => (is ?x ?y)
+#   IS is never NULL. Same argument. The same rule works for isnot.
+case-coalesce-cond ; (case (coalesce ?c ?d) ?x ?y) => (case (or (istrue ?c) (and (isnull ?c) (istrue ?d))) ?x ?y)
+#   The truth of coalesce(c,d) is the truth of c if c is non-NULL, otherwise the truth of d. The branches stay in place. The explicit-collation order c,d,x,y is unchanged.
+coalesce-into-case ; (coalesce (case ?c ?a ?b) ?d) => (case ?c (coalesce ?a ?d) (coalesce ?b ?d))
+#   The value is the same: coalesce of whichever branch is selected. Neither form has affinity.
+#   RISKY for collation: the order c,a,b,d becomes c,a,d,b,d, so it only matters if b and d carry different explicit COLLATEs and c and a carry none.
+not-coalesce-self ; (not (coalesce ?a ?a)) => (not ?a)
+#   coalesce(a,a) has the value of a. NOT depends only on the value, not on affinity or collation. The result is 0/1/NULL. The same rule works for isnull/isnotnull/istrue/isfalse.
+#   (coalesce ?a ?a) => ?a ITSELF is UNSOUND (it changes affinity in comparisons), so it is not proposed.
+coalesce-nullif-reorder ; (coalesce (nullif ?a ?b) ?a) => (coalesce ?a (nullif ?a ?b))
+#   Both have the value of a: if a=b, the left gives NULL and falls to a; the right returns a when non-NULL; and if a is NULL, nullif is NULL too. nullif stays intact.
+#   The explicit-collation order is a,b,a vs a,a,b, so the first hit is the same, whether a has an explicit COLLATE or not.
+istrue-nullif ; (istrue (nullif ?a ?b)) => (and (istrue ?a) (isnotnull (nullif ?a ?b)))
+#   If nullif is non-NULL, its value is a, so the result is the truth of a. If it is NULL, both sides are 0. nullif stays intact, with the same internal comparison.
+isfalse-nullif ; (isfalse (nullif ?a ?b)) => (and (isfalse ?a) (isnotnull (nullif ?a ?b)))
+#   Same argument as istrue-nullif.
+not-nullif-guard ; (not (nullif ?a ?b)) => (case (isnull (nullif ?a ?b)) (nullif ?a ?b) (not ?a))
+#   nullif NULL gives NOT NULL = NULL, and the branch returns that same NULL. Otherwise nullif's value is a, so the result is NOT a. The results are 0/1/NULL integers.
+#   It has low value, but it forces a CASE plan. nullif is evaluated twice, which is deterministic if a and b are.
