@@ -148,10 +148,11 @@ async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoRespons
         Ok(bytes) => bytes,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid base64 query"),
     };
-    let query_str = match String::from_utf8(query_bytes) {
-        Ok(s) => preprocess_sqlite_sql(&s),
+    let raw = match String::from_utf8(query_bytes) {
+        Ok(s) => s,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Query is not valid UTF-8"),
     };
+    let query_str = preprocess_sqlite_sql(&raw);
     let variants = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match Parser::parse_sql(&dialect, &query_str) {
             Ok(statements) if statements.len() == 1 && !prints_faithfully(&statements[0]) => {
@@ -170,9 +171,16 @@ async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoRespons
             Err(e) => Err(format!("failed to parse SQL: {}", e)),
         }
     })) {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, &e),
+        Ok(Ok(v)) => {
+            log_request(&raw, &format!("ok {}", v.len()));
+            v
+        }
+        Ok(Err(e)) => {
+            log_request(&raw, &format!("refused {}", e.split(':').next().unwrap_or("")));
+            return error_response(StatusCode::BAD_REQUEST, &e);
+        }
         Err(_) => {
+            log_request(&raw, "panic");
             eprintln!("[ERROR] e-graph computation panicked");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -189,6 +197,23 @@ async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoRespons
         }),
     )
         .into_response()
+}
+
+/// With EGRAPH_REQUEST_LOG set, one line per request: outcome, a tab, the query on one line. For
+/// measuring what the live workload sends (`--profile` reads it back); off by default.
+fn log_request(query: &str, outcome: &str) {
+    static LOG: LazyLock<Option<std::sync::Mutex<std::fs::File>>> = LazyLock::new(|| {
+        std::env::var("EGRAPH_REQUEST_LOG").ok().and_then(|path| {
+            std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(std::sync::Mutex::new)
+        })
+    });
+    if let Some(file) = LOG.as_ref() {
+        use std::io::Write;
+        let one_line = query.replace('\n', " ").replace('\r', " ").replace('\t', " ");
+        if let Ok(mut f) = file.lock() {
+            let _ = writeln!(f, "{}\t{}", outcome, one_line);
+        }
+    }
 }
 
 /// Whether printing the statement and parsing it again gives the same statement. Every variant goes
@@ -695,9 +720,127 @@ fn usage(rules_path: &str, queries_path: &str) {
     }
 }
 
+/// `egraph-server --profile requests.log`: what the workload asks of the e-graph. Reads the lines
+/// log_request wrote (or bare queries), and counts outcomes, which guard stopped a predicate, the
+/// language nodes the WHERE reaches, and - the point - the kinds of sub-expression that are still
+/// opaque atoms, i.e. what the language cannot see into yet.
+fn profile(path: &str) {
+    use std::collections::BTreeMap;
+    let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut paths: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut nodes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut atoms: BTreeMap<String, usize> = BTreeMap::new();
+    let mut atom_queries: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total = 0usize;
+    for line in std::fs::read_to_string(path).expect("cannot read").lines() {
+        let (outcome, query) = match line.split_once('\t') {
+            Some((o, q)) => (o.to_string(), q),
+            None => ("(not logged)".to_string(), line),
+        };
+        if query.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        let key = outcome.split_whitespace().take(if outcome.starts_with("ok") { 1 } else { 6 }).collect::<Vec<_>>().join(" ");
+        let key = if outcome.starts_with("ok 0") { "ok, no variants".to_string() } else { key };
+        *outcomes.entry(key).or_default() += 1;
+        let query_str = preprocess_sqlite_sql(query);
+        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, &query_str) else { continue };
+        let Some(Statement::Query(q)) = statements.first() else { continue };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            *paths.entry("not a plain SELECT (compound or VALUES)").or_default() += 1;
+            continue;
+        };
+        let Some(selection) = &select.selection else {
+            *paths.entry("no WHERE").or_default() += 1;
+            continue;
+        };
+        let path = if sql_rewrite::is_nondeterministic(selection) {
+            "guard: nondeterministic, identities only"
+        } else if sql_rewrite::explicit_collation_under_a_value(selection) {
+            "guard: explicit COLLATE under a value, identities only"
+        } else if sql_rewrite::contains_row_value(selection) {
+            "row value in WHERE"
+        } else {
+            "rewritten by the e-graph"
+        };
+        *paths.entry(path).or_default() += 1;
+        let (rec, symbols) = sql_rewrite::sql_expr_to_recexpr(selection, &query_str);
+        let mut seen = std::collections::BTreeSet::new();
+        for node in rec.as_ref() {
+            match node {
+                sql_rewrite::SqlLang::Symbol(k) => {
+                    let kind = symbols.get(k).map(atom_kind).unwrap_or_else(|| "?".to_string());
+                    *atoms.entry(kind.clone()).or_default() += 1;
+                    if seen.insert(kind.clone()) {
+                        *atom_queries.entry(kind).or_default() += 1;
+                    }
+                }
+                other => {
+                    let name = other.to_string();
+                    let name = if name.starts_with("fn:") { "fn:*".to_string() } else { name };
+                    *nodes.entry(name).or_default() += 1;
+                }
+            }
+        }
+    }
+    let print = |title: &str, map: &BTreeMap<String, usize>, of: usize| {
+        println!("\n== {} ==", title);
+        let mut v: Vec<_> = map.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, n) in v {
+            println!("{:>7}  {:>5.1}%  {}", n, 100.0 * *n as f64 / of.max(1) as f64, k);
+        }
+    };
+    println!("{} requests", total);
+    print("outcome", &outcomes, total);
+    let paths: BTreeMap<String, usize> = paths.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    print("what happens to the WHERE", &paths, total);
+    print("atoms still opaque, by queries containing them", &atom_queries, total);
+    let atom_total: usize = atoms.values().sum();
+    print("atoms still opaque, by occurrences", &atoms, atom_total);
+    let node_total: usize = nodes.values().sum();
+    print("language nodes reached", &nodes, node_total);
+}
+
+/// A readable kind for an opaque atom: leaves are columns and literals; everything else is a shape
+/// the language has no node for.
+fn atom_kind(e: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::Expr as E;
+    match e {
+        E::Identifier(_) | E::CompoundIdentifier(_) => "leaf: column".to_string(),
+        E::Value(_) => "leaf: literal".to_string(),
+        E::Nested(x) => atom_kind(x),
+        E::Function(f) => {
+            let n = match &f.args {
+                sqlparser::ast::FunctionArguments::List(l) => l.args.len(),
+                _ => 0,
+            };
+            format!("function {}({} args)", f.name.to_string().to_lowercase(), n)
+        }
+        E::InSubquery { .. } => "IN (SELECT ...)".to_string(),
+        E::Exists { .. } => "EXISTS (SELECT ...)".to_string(),
+        E::Subquery(_) => "scalar subquery".to_string(),
+        E::InList { list, .. } => format!("IN list of {} (or row value)", list.len()),
+        E::Tuple(_) => "row value".to_string(),
+        E::Collate { collation, .. } => format!("COLLATE {}", collation),
+        E::Like { .. } => "LIKE with ESCAPE".to_string(),
+        E::SimilarTo { .. } => "GLOB with ESCAPE".to_string(),
+        E::Case { .. } => "CASE (other form)".to_string(),
+        E::Cast { .. } => "CAST (other form)".to_string(),
+        E::UnaryOp { op, .. } => format!("unary {}", op),
+        E::BinaryOp { op, .. } => format!("binary operator {}", op),
+        other => format!("{:?}", other).split(|c: char| !c.is_alphanumeric()).next().unwrap_or("?").to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--profile" {
+        profile(&args[2]);
+        return;
+    }
     if args.len() == 3 && args[1] == "--novelty" {
         novelty(&args[2]);
         return;
