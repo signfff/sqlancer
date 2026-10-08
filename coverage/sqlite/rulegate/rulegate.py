@@ -55,11 +55,14 @@ EXTENSION = {"is": "({} IS {})", "isnot": "({} IS NOT {})", "uplus": "(+{})",
              "cast_text": "CAST({} AS TEXT)", "cast_numeric": "CAST({} AS NUMERIC)",
              "cast_blob": "CAST({} AS BLOB)",
              "in1": "({} IN ({}))", "in2": "({} IN ({}, {}))", "in3": "({} IN ({}, {}, {}))",
-             "like": "({} LIKE {})", "glob": "({} GLOB {})"}
+             "like": "({} LIKE {})", "glob": "({} GLOB {})",
+             "collate_binary": "({} COLLATE BINARY)", "collate_nocase": "({} COLLATE NOCASE)",
+             "collate_rtrim": "({} COLLATE RTRIM)"}
 # Operators whose result is a value that can carry a collation onward, not a truth value.
 VALUE_OPS = {"+", "-", "*", "/", "rem", "concat", "bitand", "bitor", "neg", "bitnot", "uplus", "iif", "case",
              "case2", "casesimple",
-             "coalesce", "ifnull", "nullif", "cast_int", "cast_real", "cast_text", "cast_numeric", "cast_blob"}
+             "coalesce", "ifnull", "nullif", "cast_int", "cast_real", "cast_text", "cast_numeric", "cast_blob",
+             "collate_binary", "collate_nocase", "collate_rtrim"}
 
 # Context around a value-producing side: (template, operand) with {e} for the side.
 # Numeric-looking text and typed columns expose affinity: a column carries its affinity into a

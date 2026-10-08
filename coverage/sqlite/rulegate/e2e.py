@@ -50,6 +50,8 @@ class Gen:
             choices += ["cast"]
         if "func" in self.features:
             choices += ["func", "func"]
+        if "collate" in self.features:
+            choices += ["collate", "collate"]
         k = self.r.choice(choices)
         a, b = self.value(d - 1), self.value(d - 1)
         if k == "arith":
@@ -74,6 +76,8 @@ class Gen:
             if form == 2:
                 return "(CASE %s WHEN %s THEN %s ELSE %s END)" % (self.leaf(), self.leaf(), a, b)
             return "(CASE WHEN %s THEN %s ELSE %s END)" % (self.pred(d - 1), a, b)
+        if k == "collate":
+            return "(%s COLLATE %s)" % (a, self.r.choice(["NOCASE", "RTRIM", "BINARY"]))
         if k == "func":
             f1 = ["abs", "length", "lower", "upper", "typeof", "trim", "ltrim", "rtrim", "hex", "quote",
                   "unicode", "likely", "unlikely", "round", "sign", "octet_length"]

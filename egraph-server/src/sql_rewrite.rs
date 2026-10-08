@@ -75,6 +75,10 @@ pub enum SqlLang {
     Call1(u32, [Id; 1]),
     Call2(u32, [Id; 2]),
     Call3(u32, [Id; 3]),
+    // x COLLATE BINARY / NOCASE / RTRIM; other collation names stay atoms.
+    CollateBinary([Id; 1]),
+    CollateNocase([Id; 1]),
+    CollateRtrim([Id; 1]),
     Symbol(u64),
 }
 
@@ -132,6 +136,9 @@ impl Language for SqlLang {
             SqlLang::Call1(_, c) => c,
             SqlLang::Call2(_, c) => c,
             SqlLang::Call3(_, c) => c,
+            SqlLang::CollateBinary(c) => c,
+            SqlLang::CollateNocase(c) => c,
+            SqlLang::CollateRtrim(c) => c,
             SqlLang::CastInt(c) => c,
             SqlLang::CastReal(c) => c,
             SqlLang::CastText(c) => c,
@@ -182,6 +189,9 @@ impl Language for SqlLang {
             SqlLang::Call1(_, c) => c,
             SqlLang::Call2(_, c) => c,
             SqlLang::Call3(_, c) => c,
+            SqlLang::CollateBinary(c) => c,
+            SqlLang::CollateNocase(c) => c,
+            SqlLang::CollateRtrim(c) => c,
             SqlLang::CastInt(c) => c,
             SqlLang::CastReal(c) => c,
             SqlLang::CastText(c) => c,
@@ -446,6 +456,24 @@ impl FromOp for SqlLang {
                     n => Err(format!("{}: {} arguments, one to three supported", name, n)),
                 }
             }
+            "collate_binary" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("collate_binary: expected 1 child"))?;
+                Ok(SqlLang::CollateBinary(arr))
+            }
+            "collate_nocase" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("collate_nocase: expected 1 child"))?;
+                Ok(SqlLang::CollateNocase(arr))
+            }
+            "collate_rtrim" => {
+                let arr: [Id; 1] = children
+                    .try_into()
+                    .map_err(|_| format!("collate_rtrim: expected 1 child"))?;
+                Ok(SqlLang::CollateRtrim(arr))
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -501,6 +529,9 @@ impl fmt::Display for SqlLang {
             SqlLang::In3(_) => write!(f, "in3"),
             SqlLang::Like(_) => write!(f, "like"),
             SqlLang::Glob(_) => write!(f, "glob"),
+            SqlLang::CollateBinary(_) => write!(f, "collate_binary"),
+            SqlLang::CollateNocase(_) => write!(f, "collate_nocase"),
+            SqlLang::CollateRtrim(_) => write!(f, "collate_rtrim"),
             SqlLang::Call1(n, _) | SqlLang::Call2(n, _) | SqlLang::Call3(n, _) => write!(f, "fn:{}", fn_name(*n)),
             SqlLang::CastInt(_) => write!(f, "cast_int"),
             SqlLang::CastReal(_) => write!(f, "cast_real"),
@@ -827,6 +858,18 @@ fn sql_expr_to_recexpr_impl(
             } else {
                 node
             }
+        }
+
+        // x COLLATE BINARY / NOCASE / RTRIM.
+        SqlExpr::Collate { expr: inner, collation }
+            if matches!(collation.to_string().to_ascii_uppercase().as_str(), "BINARY" | "NOCASE" | "RTRIM") =>
+        {
+            let child = sql_expr_to_recexpr_impl(inner, rec, symbols, counter, dedup, source_sql);
+            rec.add(match collation.to_string().to_ascii_uppercase().as_str() {
+                "BINARY" => SqlLang::CollateBinary([child]),
+                "NOCASE" => SqlLang::CollateNocase([child]),
+                _ => SqlLang::CollateRtrim([child]),
+            })
         }
 
         // CAST(x AS type): plain CAST only (not TRY_CAST or ::), no FORMAT.
@@ -1374,6 +1417,18 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
             recexpr_to_sql_expr_impl(expr, *b, symbols),
             recexpr_to_sql_expr_impl(expr, *c, symbols),
         ]),
+        SqlLang::CollateBinary([x]) => SqlExpr::Collate {
+            expr: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *x, symbols))),
+            collation: sqlparser::ast::ObjectName::from(vec![Ident::new("BINARY")]),
+        },
+        SqlLang::CollateNocase([x]) => SqlExpr::Collate {
+            expr: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *x, symbols))),
+            collation: sqlparser::ast::ObjectName::from(vec![Ident::new("NOCASE")]),
+        },
+        SqlLang::CollateRtrim([x]) => SqlExpr::Collate {
+            expr: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *x, symbols))),
+            collation: sqlparser::ast::ObjectName::from(vec![Ident::new("RTRIM")]),
+        },
         SqlLang::Coalesce([a, b]) => call("coalesce", vec![
             recexpr_to_sql_expr_impl(expr, *a, symbols),
             recexpr_to_sql_expr_impl(expr, *b, symbols),
@@ -2202,6 +2257,9 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::In3(_) => SqlLang::In3([child_ids[0], child_ids[1], child_ids[2], child_ids[3]]),
         SqlLang::Like(_) => SqlLang::Like([child_ids[0], child_ids[1]]),
         SqlLang::Glob(_) => SqlLang::Glob([child_ids[0], child_ids[1]]),
+        SqlLang::CollateBinary(_) => SqlLang::CollateBinary([child_ids[0]]),
+        SqlLang::CollateNocase(_) => SqlLang::CollateNocase([child_ids[0]]),
+        SqlLang::CollateRtrim(_) => SqlLang::CollateRtrim([child_ids[0]]),
         SqlLang::Call1(n, _) => SqlLang::Call1(*n, [child_ids[0]]),
         SqlLang::Call2(n, _) => SqlLang::Call2(*n, [child_ids[0], child_ids[1]]),
         SqlLang::Call3(n, _) => SqlLang::Call3(*n, [child_ids[0], child_ids[1], child_ids[2]]),
@@ -2372,6 +2430,9 @@ fn eval(
                 .map(|c| format!("{:?}", eval(expr, *c, symbols, assignment)))
                 .collect();
             SqlValue::Text(format!("{}({})", node, args.join(",")))
+        }
+        SqlLang::CollateBinary([x]) | SqlLang::CollateNocase([x]) | SqlLang::CollateRtrim([x]) => {
+            eval(expr, *x, symbols, assignment)
         }
         SqlLang::Coalesce([a, b]) => match eval(expr, *a, symbols, assignment) {
             SqlValue::Null => eval(expr, *b, symbols, assignment),
@@ -4291,9 +4352,10 @@ mod tests {
             generate_equivalent_where_clauses(&parse_predicate(sql), sql, 16, 20).expect("generates");
         assert!(!variants.is_empty(), "the rules that keep the order still apply");
         for v in &variants {
-            let s = v.to_string();
-            let binary_side = s.find("'abc' COLLATE binary").expect("keeps the literal side");
-            let nocase_side = s.find("\"c0\" COLLATE nocase").expect("keeps the column side");
+            // Case-insensitive: the collate nodes print the collation name in capitals.
+            let s = v.to_string().to_lowercase();
+            let binary_side = s.find("'abc' collate binary").expect("keeps the literal side");
+            let nocase_side = s.find("\"c0\" collate nocase").expect("keeps the column side");
             assert!(nocase_side < binary_side, "the NOCASE side moved right: {s}");
         }
     }
