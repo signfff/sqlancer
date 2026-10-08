@@ -20,7 +20,15 @@ rm -rf "$work" && mkdir -p "$work" && work=$(readlink -f "$work")
     echo "-Degraph.singleSideEmptyLog=$work/sse.sql"
     echo "-Degraph.optMask.log=$work/optmask.log"
     for extra in "$@"; do echo "$extra"; done
-    grep -v -E '^-Dorg\.sqlite\.lib\.|^-Degraph\.referee\.|^-Dsqlite3\.egraph\.autoResearchResults=|^-Degraph\.(trace\.file|singleSideEmptyLog|optMask)' "$template" \
+    # Every output path of the template run is dropped and pointed into the work directory: on
+    # 2026-10-08 the benchmark's 3.53.4 mismatches landed in the long run's repro/ and looked like
+    # unreproducible trunk findings there.
+    echo "-Degraph.repro.dir=$work/repro"
+    echo "-Degraph.integrity.log=$work/integrity.log"
+    echo "-Degraph.knownBugs.log=$work/known-bugs.sql"
+    echo "-Degraph.variantOnlyError.log=$work/variant-only-errors.log"
+    echo "-Degraph.coverage.file=$work/workload-hints.txt"
+    grep -v -E '^-Dorg\.sqlite\.lib\.|^-Degraph\.referee\.|^-Dsqlite3\.egraph\.autoResearchResults=|^-Degraph\.(trace\.file|singleSideEmptyLog|optMask|repro\.dir|integrity\.log|knownBugs\.log|variantOnlyError\.log|coverage\.file|replay\.file|contextReplay\.file)' "$template" \
         | sed -E "s|^--timeout-seconds=.*|--timeout-seconds=$seconds|; s|^--egraph-input-file=.*|--egraph-input-file=$corpus|"
     echo "-Dorg.sqlite.lib.path=$lib"
     echo "-Dorg.sqlite.lib.name=libsqlitejdbc.so"
