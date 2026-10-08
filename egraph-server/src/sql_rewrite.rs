@@ -55,7 +55,9 @@ pub enum SqlLang {
     Remainder([Id; 2]), // % modulo
     Is([Id; 2]),        // x IS y (IS NOT DISTINCT FROM): equality where NULL equals NULL
     IsNot([Id; 2]),     // x IS NOT y (IS DISTINCT FROM)
-    Case([Id; 3]),      // CASE WHEN c THEN a ELSE b END (searched, one WHEN)
+    Case([Id; 3]),      // CASE WHEN c THEN a ELSE b END (searched, one WHEN); also iif(c, a, b)
+    Coalesce([Id; 2]),  // coalesce(a, b) and ifnull(a, b), which SQLite implements alike
+    Nullif([Id; 2]),    // nullif(a, b)
     Symbol(u64),
 }
 
@@ -95,6 +97,8 @@ impl Language for SqlLang {
             SqlLang::Is(c) => c,
             SqlLang::IsNot(c) => c,
             SqlLang::Case(c) => c,
+            SqlLang::Coalesce(c) => c,
+            SqlLang::Nullif(c) => c,
             SqlLang::Symbol(_) => &[],
         }
     }
@@ -130,6 +134,8 @@ impl Language for SqlLang {
             SqlLang::Is(c) => c,
             SqlLang::IsNot(c) => c,
             SqlLang::Case(c) => c,
+            SqlLang::Coalesce(c) => c,
+            SqlLang::Nullif(c) => c,
             SqlLang::Symbol(_) => &mut [],
         }
     }
@@ -308,6 +314,18 @@ impl FromOp for SqlLang {
                     .map_err(|_| format!("case: expected 3 children"))?;
                 Ok(SqlLang::Case(arr))
             }
+            "coalesce" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("coalesce: expected 2 children"))?;
+                Ok(SqlLang::Coalesce(arr))
+            }
+            "nullif" => {
+                let arr: [Id; 2] = children
+                    .try_into()
+                    .map_err(|_| format!("nullif: expected 2 children"))?;
+                Ok(SqlLang::Nullif(arr))
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -356,6 +374,8 @@ impl fmt::Display for SqlLang {
             SqlLang::Is(_) => write!(f, "is"),
             SqlLang::IsNot(_) => write!(f, "isnot"),
             SqlLang::Case(_) => write!(f, "case"),
+            SqlLang::Coalesce(_) => write!(f, "coalesce"),
+            SqlLang::Nullif(_) => write!(f, "nullif"),
             SqlLang::Symbol(k) => write!(f, "{}", k),
         }
     }
@@ -603,6 +623,33 @@ fn sql_expr_to_recexpr_impl(
             rec.add(SqlLang::IsNot([l, r]))
         }
 
+        // coalesce / ifnull with two arguments, nullif, and iif (SQLite's own spelling of a one-WHEN
+        // CASE). Anything else about the call - more arguments, FILTER, OVER, DISTINCT - stays an atom.
+        SqlExpr::Function(f) if plain_call_args(f).is_some() => {
+            let args = plain_call_args(f).unwrap();
+            let name = f.name.to_string().to_ascii_lowercase();
+            let mut child = |e: &SqlExpr| sql_expr_to_recexpr_impl(e, rec, symbols, counter, dedup, source_sql);
+            match (name.as_str(), args.len()) {
+                ("coalesce" | "ifnull", 2) => {
+                    let a = child(args[0]);
+                    let b = child(args[1]);
+                    rec.add(SqlLang::Coalesce([a, b]))
+                }
+                ("nullif", 2) => {
+                    let a = child(args[0]);
+                    let b = child(args[1]);
+                    rec.add(SqlLang::Nullif([a, b]))
+                }
+                ("iif", 3) => {
+                    let c = child(args[0]);
+                    let a = child(args[1]);
+                    let b = child(args[2]);
+                    rec.add(SqlLang::Case([c, a, b]))
+                }
+                _ => make_symbol(expr, rec, symbols, counter, dedup, source_sql),
+            }
+        }
+
         // A searched CASE with one WHEN. A missing ELSE is ELSE NULL. More WHENs, and the simple
         // form CASE x WHEN ..., stay one opaque atom.
         SqlExpr::Case {
@@ -664,6 +711,12 @@ pub fn contains_row_value(expr: &SqlExpr) -> bool {
             high,
             ..
         } => contains_row_value(inner) || contains_row_value(low) || contains_row_value(high),
+        // coalesce / ifnull / nullif / iif are nodes now, so the rules reach their arguments.
+        SqlExpr::Function(f)
+            if matches!(f.name.to_string().to_ascii_lowercase().as_str(), "coalesce" | "ifnull" | "nullif" | "iif") =>
+        {
+            plain_call_args(f).map_or(false, |args| args.iter().any(|a| contains_row_value(a)))
+        }
         // A one-WHEN CASE is a node now, so the rules reach inside it.
         SqlExpr::Case {
             operand: None,
@@ -713,65 +766,42 @@ pub fn contains_row_value(expr: &SqlExpr) -> bool {
 /// would have been sound. Two sides spelled the same way are the same collation whatever it is, so
 /// `c0 = c0` stays rewritable, and that is the common case in generated predicates.
 pub fn compares_columns_of_unknown_collation(expr: &SqlExpr) -> bool {
-    match expr {
-        SqlExpr::Nested(inner) => compares_columns_of_unknown_collation(inner),
-        SqlExpr::UnaryOp { expr: inner, .. } => compares_columns_of_unknown_collation(inner),
-        SqlExpr::BinaryOp { left, op, right } => {
-            if is_collation_sensitive_operator(op)
-                && ((mentions_a_column(left) && mentions_a_column(right))
-                    || (carries_explicit_collation(left) && carries_explicit_collation(right)))
-                && left.to_string() != right.to_string()
-            {
-                return true;
-            }
-            compares_columns_of_unknown_collation(left)
-                || compares_columns_of_unknown_collation(right)
+    // Every subexpression, through the visitor: this used to recurse through a list of shapes, and
+    // each node added to the language (IS, CASE, the function nodes) let the rules reach comparisons
+    // the list did not visit. Looking inside an atom the rules cannot reach only withholds more.
+    sqlparser::ast::visit_expressions(expr, |e| {
+        if compares_two_collations_here(e) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
         }
+    })
+    .is_break()
+}
+
+fn compares_two_collations_here(expr: &SqlExpr) -> bool {
+    let two_sides = |left: &SqlExpr, right: &SqlExpr| {
+        ((mentions_a_column(left) && mentions_a_column(right))
+            || (carries_explicit_collation(left) && carries_explicit_collation(right)))
+            && left.to_string() != right.to_string()
+    };
+    match expr {
+        SqlExpr::BinaryOp { left, op, right } => is_collation_sensitive_operator(op) && two_sides(left, right),
+        // IS picks its collation the way = does.
+        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => two_sides(left, right),
         SqlExpr::Between {
             expr: inner,
             low,
             high,
             ..
         } => {
-            if (mentions_a_column(inner) && (mentions_a_column(low) || mentions_a_column(high)))
+            ((mentions_a_column(inner) && (mentions_a_column(low) || mentions_a_column(high)))
                 || (carries_explicit_collation(inner)
-                    && (carries_explicit_collation(low) || carries_explicit_collation(high)))
-            {
-                let inner_text = inner.to_string();
-                if inner_text != low.to_string() || inner_text != high.to_string() {
-                    return true;
+                    && (carries_explicit_collation(low) || carries_explicit_collation(high))))
+                && {
+                    let inner_text = inner.to_string();
+                    inner_text != low.to_string() || inner_text != high.to_string()
                 }
-            }
-            compares_columns_of_unknown_collation(inner)
-                || compares_columns_of_unknown_collation(low)
-                || compares_columns_of_unknown_collation(high)
-        }
-        SqlExpr::IsNull(inner)
-        | SqlExpr::IsNotNull(inner)
-        | SqlExpr::IsTrue(inner)
-        | SqlExpr::IsFalse(inner)
-        | SqlExpr::IsNotTrue(inner)
-        | SqlExpr::IsNotFalse(inner)
-        | SqlExpr::IsUnknown(inner)
-        | SqlExpr::IsNotUnknown(inner) => compares_columns_of_unknown_collation(inner),
-        // The rules reach the comparisons inside a one-WHEN CASE (it is a node now).
-        SqlExpr::Case {
-            operand: None,
-            conditions,
-            else_result,
-            ..
-        } if conditions.len() == 1 => {
-            compares_columns_of_unknown_collation(&conditions[0].condition)
-                || compares_columns_of_unknown_collation(&conditions[0].result)
-                || else_result.as_deref().map_or(false, compares_columns_of_unknown_collation)
-        }
-        // IS picks its collation the way = does.
-        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
-            ((mentions_a_column(left) && mentions_a_column(right))
-                || (carries_explicit_collation(left) && carries_explicit_collation(right)))
-                && left.to_string() != right.to_string()
-                || compares_columns_of_unknown_collation(left)
-                || compares_columns_of_unknown_collation(right)
         }
         _ => false,
     }
@@ -802,6 +832,49 @@ fn carries_explicit_collation(expr: &SqlExpr) -> bool {
 
 /// Whether a subexpression mentions a column at all. A side whose collation is explicit is left to
 /// carries_explicit_collation.
+/// The arguments of a plain call `name(a, b, ...)`: no DISTINCT, FILTER, OVER, named or `*` argument.
+fn plain_call_args(f: &sqlparser::ast::Function) -> Option<Vec<&SqlExpr>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    if f.filter.is_some() || f.over.is_some() || f.null_treatment.is_some() || !f.within_group.is_empty() {
+        return None;
+    }
+    if !matches!(f.parameters, FunctionArguments::None) {
+        return None;
+    }
+    let FunctionArguments::List(list) = &f.args else { return None };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    list.args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        })
+        .collect()
+}
+
+fn call(name: &str, args: Vec<SqlExpr>) -> SqlExpr {
+    use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, ObjectName};
+    SqlExpr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(name)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e)))
+                .collect(),
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
 fn mentions_a_column(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
@@ -991,6 +1064,14 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
             Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
             Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
         ),
+        SqlLang::Coalesce([a, b]) => call("coalesce", vec![
+            recexpr_to_sql_expr_impl(expr, *a, symbols),
+            recexpr_to_sql_expr_impl(expr, *b, symbols),
+        ]),
+        SqlLang::Nullif([a, b]) => call("nullif", vec![
+            recexpr_to_sql_expr_impl(expr, *a, symbols),
+            recexpr_to_sql_expr_impl(expr, *b, symbols),
+        ]),
         SqlLang::Case([c, a, b]) => SqlExpr::Case {
             case_token: AttachedToken::empty(),
             end_token: AttachedToken::empty(),
@@ -1658,6 +1739,8 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::Is(_) => SqlLang::Is([child_ids[0], child_ids[1]]),
         SqlLang::IsNot(_) => SqlLang::IsNot([child_ids[0], child_ids[1]]),
         SqlLang::Case(_) => SqlLang::Case([child_ids[0], child_ids[1], child_ids[2]]),
+        SqlLang::Coalesce(_) => SqlLang::Coalesce([child_ids[0], child_ids[1]]),
+        SqlLang::Nullif(_) => SqlLang::Nullif([child_ids[0], child_ids[1]]),
         SqlLang::Symbol(k) => SqlLang::Symbol(*k),
     }
 }
@@ -1777,6 +1860,19 @@ fn eval(
         SqlLang::NotEq([l, r]) => order_compare(expr, *l, *r, symbols, assignment, |o| {
             o != std::cmp::Ordering::Equal
         }),
+        SqlLang::Coalesce([a, b]) => match eval(expr, *a, symbols, assignment) {
+            SqlValue::Null => eval(expr, *b, symbols, assignment),
+            v => v,
+        },
+        SqlLang::Nullif([a, b]) => {
+            let av = eval(expr, *a, symbols, assignment);
+            let bv = eval(expr, *b, symbols, assignment);
+            if av.partial_cmp(&bv) == Some(std::cmp::Ordering::Equal) {
+                SqlValue::Null
+            } else {
+                av
+            }
+        }
         SqlLang::Case([c, a, b]) => {
             if truth_value(&eval(expr, *c, symbols, assignment)) == SqlValue::Bool(true) {
                 eval(expr, *a, symbols, assignment)

@@ -23,6 +23,7 @@ Writes one line per rule to stdout and, with --json FILE, the counterexamples.
 """
 import argparse
 import itertools
+import random
 import json
 import re
 import sqlite3
@@ -36,6 +37,7 @@ EXPLICIT = "COLL"  # (vN.c_text COLLATE NOCASE)
 SCHEMA = ("CREATE TABLE v(c_int INTEGER, c_real REAL, c_text TEXT, c_blob BLOB, c_num NUMERIC, c_any, "
           "c_nocase TEXT COLLATE NOCASE, c_rtrim TEXT COLLATE RTRIM)")
 
+SAMPLE = 60000
 OPERAND_SWAPPING = {"eq-sym", "noteq-sym", "gt-to-lt", "lt-to-gt", "gteq-to-lteq", "lteq-to-gteq", "is-sym", "isnot-sym"}
 
 BINARY = {"and": "AND", "or": "OR", "=": "=", "<>": "<>", "<": "<", ">": ">", "<=": "<=", ">=": ">=",
@@ -141,7 +143,10 @@ def check_rule(rule):
         db.execute("INSERT INTO v VALUES (%s)" % ", ".join([lit] * len(COLUMNS)))
     db.execute("CREATE TABLE w AS SELECT * FROM v")
     checked = 0
-    for choice in itertools.product(options(), repeat=len(vs)):
+    # Exhaustive up to three variables (24389 bindings); beyond that a fixed-seed sample of
+    # SAMPLE bindings, each still run in every context. Four variables would be 707281, five 20.5M.
+    choices = list(itertools.product(options(), repeat=len(vs))) if len(vs) <= 3 else         [tuple(rnd.choice(options()) for _ in vs) for rnd in [random.Random(len(vs))] for _ in range(SAMPLE)]
+    for choice in choices:
         cols = [c for c in choice if c[0] == "col"]
         if name in OPERAND_SWAPPING and len(vs) >= 2:
             a, b = choice[0], choice[1]

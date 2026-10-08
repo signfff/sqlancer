@@ -38,7 +38,7 @@ class Gen:
             return self.leaf()
         choices = ["arith", "concat", "bit", "neg"]
         if "coalesce" in self.features:
-            choices += ["coalesce", "ifnull", "nullif"]
+            choices += ["coalesce", "ifnull", "nullif", "iif"]
         if "case" in self.features:
             choices += ["case"]
         if "cast" in self.features:
@@ -55,6 +55,8 @@ class Gen:
             return "(- %s)" % a
         if k in ("coalesce", "ifnull", "nullif"):
             return "%s(%s, %s)" % (k, a, b)
+        if k == "iif":
+            return "iif(%s, %s, %s)" % (self.pred(d - 1), a, b)
         if k == "case":
             form = self.r.randint(0, 3)
             if form == 0:
