@@ -347,7 +347,7 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                             : sqlancer.sqlite3.oracle.EGraphTempSchemaDump.statements(state.getConnection());
                     sqlancer.sqlite3.oracle.EGraphReproBundle.save(currentDatabaseFile(state), querySource,
                             rewriteQuery, originalQuery, variantQuery, currentMask, originalResult, variantResult,
-                            tempStatements);
+                            tempStatements, state == null ? null : state.getConnection());
                     if (currentMask != 0) {
                         attributeMaskedFinding(generatedQuery.truncation(), originalQuery, variantQuery,
                                 originalResult, variantResult);

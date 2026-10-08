@@ -48,6 +48,38 @@ class TestEGraphTempSchemaDump {
     }
 
     @Test
+    void mainSchemaIsReadThroughTheConnectionInsideATransaction() throws Exception {
+        try (Connection a = DriverManager.getConnection("jdbc:sqlite::memory:");
+                Connection b = DriverManager.getConnection("jdbc:sqlite::memory:")) {
+            try (Statement s = a.createStatement()) {
+                s.execute("CREATE TABLE t0(c0 INT, c1 TEXT, PRIMARY KEY(c0))");
+                s.execute("CREATE TABLE t1(a INTEGER PRIMARY KEY, b)");
+                s.execute("INSERT INTO t0 VALUES (1, '-89807229'), (2, 'x')");
+                s.execute("INSERT INTO t1 VALUES (5, 'five')");
+                s.execute("CREATE INDEX i0 ON t0(c1)");
+                s.execute("CREATE VIEW v74(vout) AS SELECT t0.c1 FROM t0 GROUP BY t0.c1");
+                s.execute("ANALYZE");
+                s.execute("BEGIN");
+                s.execute("DELETE FROM t0 WHERE c0 = 2");
+                s.execute("UPDATE t0 SET c0 = -89807229");
+            }
+            try (Statement s = b.createStatement()) {
+                for (String sql : EGraphTempSchemaDump.statements(new SQLConnection(a), "main")) {
+                    s.execute(sql);
+                }
+                for (String sql : EGraphTempSchemaDump.internalTables(new SQLConnection(a), "main")) {
+                    s.execute(sql);
+                }
+            }
+            for (String q : new String[] { "SELECT rowid, quote(c0), quote(c1) FROM t0", "SELECT * FROM t1",
+                    "SELECT * FROM v74", "SELECT * FROM sqlite_stat1 ORDER BY idx",
+                    "SELECT name FROM sqlite_master ORDER BY name" }) {
+                assertEquals(rows(a, q), rows(b, q), q);
+            }
+        }
+    }
+
+    @Test
     void qualifiesTheNameIntoTemp() {
         assertEquals("CREATE UNIQUE INDEX temp.i ON t(c)", EGraphTempSchemaDump.intoTemp("CREATE UNIQUE INDEX i ON t(c)"));
         assertEquals("CREATE TABLE temp.\"a b\"(c)", EGraphTempSchemaDump.intoTemp("CREATE TABLE \"a b\"(c)"));

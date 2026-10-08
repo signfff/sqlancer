@@ -33,6 +33,15 @@ public final class EGraphTempSchemaDump {
 
     /** The statements, or an empty list when there are no TEMP objects or they could not be read. */
     public static List<String> statements(Object connection) {
+        return statements(connection, "temp");
+    }
+
+    /**
+     * The same for a schema of the connection, "main" or "temp", read through the connection so that rows of a
+     * transaction it has not committed are included - which a copy of the database file does not have. SQLite's own
+     * tables (sqlite_stat1, sqlite_sequence, ...) are left to {@link #internalTables}.
+     */
+    public static List<String> statements(Object connection, String schema) {
         List<String> result = new ArrayList<>();
         if (!(connection instanceof SQLConnection)) {
             return result;
@@ -40,7 +49,8 @@ public final class EGraphTempSchemaDump {
         try (Statement s = ((SQLConnection) connection).createStatement()) {
             List<String[]> objects = new ArrayList<>();
             try (ResultSet rs = s.executeQuery(
-                    "SELECT type, name, sql FROM temp.sqlite_master WHERE sql IS NOT NULL ORDER BY rowid")) {
+                    "SELECT type, name, sql FROM " + schema + ".sqlite_master WHERE sql IS NOT NULL "
+                            + "AND substr(name, 1, 7) <> 'sqlite_' ORDER BY rowid")) {
                 while (rs.next()) {
                     objects.add(new String[] { rs.getString(1), rs.getString(2), rs.getString(3) });
                 }
@@ -55,16 +65,16 @@ public final class EGraphTempSchemaDump {
             List<String> tables = new ArrayList<>();
             for (String[] o : objects) {
                 if ("table".equals(o[0]) && virtualTables.stream().noneMatch(o[1]::startsWith)) {
-                    result.add(intoTemp(o[2]));
+                    result.add(into(schema, o[2]));
                     tables.add(o[1]);
                 }
             }
             for (String table : tables) {
-                result.addAll(inserts(s, table));
+                result.addAll(inserts(s, schema, table));
             }
             for (String[] o : objects) {
                 if (!"table".equals(o[0])) {
-                    result.add(intoTemp(o[2]));
+                    result.add(into(schema, o[2]));
                 }
             }
         } catch (SQLException | RuntimeException e) {
@@ -82,17 +92,37 @@ public final class EGraphTempSchemaDump {
      * The stored text is normalised up to the name, which makes qualifying the name enough.
      */
     static String intoTemp(String sql) {
-        return CREATE.matcher(sql.strip()).replaceFirst("$1 temp.");
+        return into("temp", sql);
     }
 
-    private static List<String> inserts(Statement s, String table) throws SQLException {
-        String quotedTable = "temp.\"" + table.replace("\"", "\"\"") + "\"";
+    private static String into(String schema, String sql) {
+        return CREATE.matcher(sql.strip()).replaceFirst("$1 " + schema + ".");
+    }
+
+    private static List<String> inserts(Statement s, String schema, String table) throws SQLException {
+        String quotedTable = schema + ".\"" + table.replace("\"", "\"\"") + "\"";
         List<String> columns = new ArrayList<>();
-        try (ResultSet rs = s.executeQuery("PRAGMA temp.table_xinfo(\"" + table.replace("\"", "\"\"") + "\")")) {
+        boolean integerPrimaryKey = false;
+        int primaryKeyColumns = 0;
+        try (ResultSet rs = s.executeQuery(
+                "PRAGMA " + schema + ".table_xinfo(\"" + table.replace("\"", "\"\"") + "\")")) {
             while (rs.next()) {
+                if (rs.getInt("pk") > 0) {
+                    primaryKeyColumns++;
+                    integerPrimaryKey = "INTEGER".equalsIgnoreCase(rs.getString("type"));
+                }
                 if (rs.getInt("hidden") == 0) {
                     columns.add("\"" + rs.getString("name").replace("\"", "\"\"") + "\"");
                 }
+            }
+        }
+        // The rowid too, where it is not a column already: a plan can depend on it, and a fresh
+        // insert would number the rows anew.
+        if (!(integerPrimaryKey && primaryKeyColumns == 1) && !columns.isEmpty()) {
+            try (ResultSet rs = s.executeQuery("SELECT rowid FROM " + quotedTable + " LIMIT 0")) {
+                columns.add(0, "rowid");
+            } catch (SQLException withoutRowid) {
+                // A WITHOUT ROWID table, or a virtual table without one.
             }
         }
         List<String> result = new ArrayList<>();
@@ -109,6 +139,52 @@ public final class EGraphTempSchemaDump {
             while (rs.next()) {
                 result.add(prefix + rs.getString(1) + ")");
             }
+        }
+        return result;
+    }
+
+    /**
+     * Rows of SQLite's own tables in a schema - the planner's statistics and AUTOINCREMENT counters - as statements
+     * that put them back after the objects exist: ANALYZE creates the statistics tables, the rows replace whatever it
+     * computed, and ANALYZE sqlite_schema makes the planner load them.
+     */
+    public static List<String> internalTables(Object connection, String schema) {
+        List<String> result = new ArrayList<>();
+        if (!(connection instanceof SQLConnection)) {
+            return result;
+        }
+        try (Statement s = ((SQLConnection) connection).createStatement()) {
+            List<String> present = new ArrayList<>();
+            try (ResultSet rs = s.executeQuery("SELECT name FROM " + schema + ".sqlite_master WHERE type = 'table' "
+                    + "AND name IN ('sqlite_stat1', 'sqlite_stat4', 'sqlite_sequence')")) {
+                while (rs.next()) {
+                    present.add(rs.getString(1));
+                }
+            }
+            boolean stats = present.contains("sqlite_stat1") || present.contains("sqlite_stat4");
+            if (stats) {
+                result.add("ANALYZE " + schema);
+            }
+            for (String table : present) {
+                result.add("DELETE FROM " + schema + "." + table);
+                String select = "sqlite_stat4".equals(table)
+                        ? "SELECT quote(tbl) || ',' || quote(idx) || ',' || quote(neq) || ',' || quote(nlt) || ',' || "
+                                + "quote(ndlt) || ',' || quote(sample) FROM " + schema + "." + table
+                        : "sqlite_stat1".equals(table)
+                                ? "SELECT quote(tbl) || ',' || quote(idx) || ',' || quote(stat) FROM " + schema + "."
+                                        + table
+                                : "SELECT quote(name) || ',' || quote(seq) FROM " + schema + "." + table;
+                try (ResultSet rs = s.executeQuery(select)) {
+                    while (rs.next()) {
+                        result.add("INSERT INTO " + schema + "." + table + " VALUES (" + rs.getString(1) + ")");
+                    }
+                }
+            }
+            if (stats) {
+                result.add("ANALYZE " + schema + ".sqlite_schema");
+            }
+        } catch (SQLException | RuntimeException e) {
+            return new ArrayList<>();
         }
         return result;
     }

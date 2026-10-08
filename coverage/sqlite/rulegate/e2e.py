@@ -56,6 +56,14 @@ class Gen:
         if k in ("coalesce", "ifnull", "nullif"):
             return "%s(%s, %s)" % (k, a, b)
         if k == "case":
+            form = self.r.randint(0, 3)
+            if form == 0:
+                return "(CASE WHEN %s THEN %s END)" % (self.pred(d - 1), a)
+            if form == 1:
+                return "(CASE WHEN %s THEN %s WHEN %s THEN %s ELSE %s END)" % (
+                    self.pred(d - 1), a, self.pred(d - 1), b, self.leaf())
+            if form == 2:
+                return "(CASE %s WHEN %s THEN %s ELSE %s END)" % (self.leaf(), self.leaf(), a, b)
             return "(CASE WHEN %s THEN %s ELSE %s END)" % (self.pred(d - 1), a, b)
         if k == "cast":
             return "CAST(%s AS %s)" % (a, self.r.choice(["INTEGER", "REAL", "TEXT", "NUMERIC", "BLOB"]))

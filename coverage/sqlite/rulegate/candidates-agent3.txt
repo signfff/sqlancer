@@ -1,0 +1,80 @@
+# Candidate rules involving case (agent1, round 3). Nothing here has been run yet: every rule should go through rulegate.
+# Facts and assumptions used throughout:
+#   - CASE selects a branch by the truth of c: c must be non-NULL and nonzero. The same test is used by istrue/WHERE/AND/OR.
+#   - A CASE result has no affinity. Affinity only matters inside comparisons (= <> < > <= >= between is isnot).
+#     Arithmetic, ||, & | ~, NOT, AND/OR, IS TRUE and ISNULL act only on the stored value, so wrapping or unwrapping CASE around them is safe.
+#     I deliberately give NO rule that moves a comparison into or out of a CASE branch:
+#       (= (case ?c ?a ?b) ?d) => (case ?c (= ?a ?d) (= ?b ?d)) is UNSOUND, because inside the branch a INTEGER column's affinity gets applied to d.
+#   - COLLATION RISK, from my memory of sqlite3ExprCollSeq; please verify. When a CASE result is compared, I believe SQLite takes the collation of the
+#     FIRST item carrying an explicit COLLATE, searching the list [cond, then, else] in order (the condition included), and descending pLeft before pRight.
+#     A rule is therefore marked risky if it changes the order in which explicitly collated sub-expressions appear. Most rules below keep that order.
+#     I only use the result in non-comparison contexts, so rules that wrap the CASE result in NOT, ISNULL or arithmetic are unaffected.
+#   - Rules that use a variable twice change results when it is non-deterministic, as in the earlier rounds.
+
+## Restructuring the condition (branch values keep their positions)
+
+case-istrue-cond ; (case ?c ?a ?b) => (case (istrue ?c) ?a ?b)
+#   CASE takes the THEN branch exactly when c is true, which is exactly when IS TRUE gives 1. Sound in both directions. The order of collated items is unchanged.
+case-not-cond-to-isfalse ; (case (not ?c) ?a ?b) => (case (isfalse ?c) ?a ?b)
+#   NOT c is true exactly when c is false. NULL makes NOT c NULL, which is not true, and IS FALSE of NULL is 0. Sound in both directions.
+case-isnull-swap ; (case (isnull ?x) ?a ?b) => (case (isnotnull ?x) ?b ?a)
+#   ISNULL is never NULL, so NOT-style swapping is exact here, unlike the general case-swap. Sound in both directions.
+#   COLLATION RISK, as for every swap rule: if a and b both carry different explicit COLLATEs, the swap changes which branch is collated first. case-swap already passed, so this should pass too.
+case-is-swap ; (case (is ?x ?y) ?a ?b) => (case (isnot ?x ?y) ?b ?a)
+#   IS is never NULL, so the condition and its IS NOT complement send every row to opposite branches. It has the same swap collation note.
+case-istrue-swap ; (case (istrue ?c) ?a ?b) => (case (isnottrue ?c) ?b ?a)
+#   IS TRUE and IS NOT TRUE are exact 0/1 complements, never NULL. It has the same swap collation note.
+case-isfalse-swap ; (case (isfalse ?c) ?a ?b) => (case (isnotfalse ?c) ?b ?a)
+#   IS FALSE and IS NOT FALSE are exact 0/1 complements. It has the same swap collation note.
+case-and-nest ; (case (and ?c ?d) ?a ?b) => (case ?c (case ?d ?a ?b) ?b)
+#   AND is true iff both c and d are true. c not true gives b; c true then depends on d. The collated-item order c,d,a,b is unchanged. Sound in both directions.
+case-or-nest ; (case (or ?c ?d) ?a ?b) => (case ?c ?a (case ?d ?a ?b))
+#   OR is true iff c or d is true; c NULL with d true still reaches a through the inner CASE.
+#   RISKY for collation: the order of collated items changes from c,d,a,b to c,a,d,b, so it only matters if both d and a carry explicit COLLATEs.
+case-same-cond-then ; (case ?c (case ?c ?a ?b) ?d) => (case ?c ?a ?d)
+#   The inner CASE is reached only when c is true, so it always yields a. This needs a deterministic c.
+#   RISKY for collation: the rule drops b, which may be the first explicitly collated item.
+case-same-cond-else ; (case ?c ?a (case ?c ?b ?d)) => (case ?c ?a ?d)
+#   The inner CASE is reached only when c is not true, so it always yields d.
+#   RISKY for collation: the rule drops b, which may be the first explicitly collated item.
+case-cond-case ; (case (case ?c ?d ?e) ?a ?b) => (case ?c (case ?d ?a ?b) (case ?e ?a ?b))
+#   The truth of the inner CASE is the truth of whichever of d/e it selects, and that branch is selected by the same test on c.
+#   RISKY for collation: the order changes from c,d,e,a,b to c,d,a,b,e.
+
+## Pushing value-only operators into or out of CASE branches (no comparison involved, so affinity is irrelevant)
+
+not-into-case ; (not (case ?c ?a ?b)) => (case ?c (not ?a) (not ?b))
+#   NOT applies to the selected value, and numeric conversion does not depend on affinity. The result is a 0/1/NULL integer, so collation does not matter. Sound in both directions.
+isnull-into-case ; (isnull (case ?c ?a ?b)) => (case ?c (isnull ?a) (isnull ?b))
+#   The CASE result is NULL iff the selected branch is NULL. The result is 0/1. The same rule works for isnotnull. Sound in both directions.
+istrue-into-case ; (istrue (case ?c ?a ?b)) => (case ?c (istrue ?a) (istrue ?b))
+#   The truth of the selected value. The same rule works for isfalse/isnottrue/isnotfalse. Sound in both directions.
+neg-into-case ; (neg (case ?c ?a ?b)) => (case ?c (neg ?a) (neg ?b))
+#   Unary minus is 0-value, computed from the stored value. The overflow and REAL behaviour are the same, because the same operand reaches it. Sound in both directions.
+bitnot-into-case ; (bitnot (case ?c ?a ?b)) => (case ?c (bitnot ?a) (bitnot ?b))
+#   ~ converts the selected value to int64 the same way on both sides.
+add-into-case ; (+ (case ?c ?a ?b) ?d) => (case ?c (+ ?a ?d) (+ ?b ?d))
+#   Arithmetic uses the operands' storage classes, not their affinity, and the left/right order of + is kept, so the overflow-to-REAL behaviour is the same. The same rule works for - * / rem, which keep operand order.
+#   NOTE: d is evaluated after c on both sides. That only matters if d is non-deterministic.
+concat-into-case ; (concat (case ?c ?a ?b) ?d) => (case ?c (concat ?a ?d) (concat ?b ?d))
+#   || converts the selected value to TEXT the same way on both sides, and the operand order is kept.
+and-into-case ; (and (case ?c ?a ?b) ?d) => (case ?c (and ?a ?d) (and ?b ?d))
+#   AND uses only the truth of its operands. On each side, the left operand is the same selected value. The result is 0/1/NULL.
+or-into-case ; (or (case ?c ?a ?b) ?d) => (case ?c (or ?a ?d) (or ?b ?d))
+#   Same argument as and-into-case.
+
+## Expressing boolean operators as CASE (constant-free: (isnotnull ?x) where x is known non-NULL gives 1, (isnull (isnull ?x)) gives 0)
+
+istrue-to-case ; (istrue ?x) => (case ?x (isnotnull ?x) (isnull (isnull ?x)))
+#   x true implies x is non-NULL, so the THEN branch yields integer 1. Otherwise the ELSE branch is ISNULL of a 0/1 value, which yields integer 0. Both sides are integers, so quote() is the same.
+isnottrue-to-case ; (isnottrue ?x) => (case ?x (isnull ?x) (isnotnull (isnull ?x)))
+#   x true gives 0, because x is non-NULL. Otherwise the result is 1.
+isfalse-to-case ; (isfalse ?x) => (case (not ?x) (isnotnull ?x) (isnull (isnull ?x)))
+#   NOT x is true exactly when x is false, and then x is non-NULL, giving 1. Otherwise 0.
+and-to-case ; (and ?x ?y) => (case ?x (not (not ?y)) (and ?x ?y))
+#   x true: x AND y is the truth of y as 0/1/NULL, which is exactly NOT NOT y (1 AND 5 = 1 = NOT NOT 5; NULL stays NULL). x not true: the result is unchanged.
+or-to-case ; (or ?x ?y) => (case ?x (isnotnull ?x) (or ?x ?y))
+#   x true: OR is 1, and isnotnull(x) is 1. Otherwise the result is unchanged.
+case-bool-to-andor ; (case ?c (not ?a) (not ?b)) => (or (and (istrue ?c) (not ?a)) (and (isnottrue ?c) (not ?b)))
+#   The branches are 0/1/NULL. c true gives (not a) OR (0 AND …)=(not a) OR 0, which keeps NULL as NULL. c not true gives 0 OR (not b).
+#   This is only valid because the branches are already 0/1/NULL. With raw ?a/?b it would be UNSOUND (5 becomes 1). Sound in both directions.

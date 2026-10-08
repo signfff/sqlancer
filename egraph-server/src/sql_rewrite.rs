@@ -1,8 +1,8 @@
 use egg::{rewrite, EGraph, FromOp, Id, Language, RecExpr, Rewrite, Runner};
 use rusqlite::Connection;
 use sqlparser::ast::{
-    BinaryOperator, Expr as SqlExpr, GroupByExpr, Ident, OrderByKind, Query, SelectItem, SetExpr,
-    UnaryOperator,
+    helpers::attached_token::AttachedToken, BinaryOperator, CaseWhen, Expr as SqlExpr, GroupByExpr,
+    Ident, OrderByKind, Query, SelectItem, SetExpr, UnaryOperator, Value,
 };
 use sqlparser::tokenizer::Span;
 use std::collections::{HashMap, HashSet};
@@ -55,6 +55,7 @@ pub enum SqlLang {
     Remainder([Id; 2]), // % modulo
     Is([Id; 2]),        // x IS y (IS NOT DISTINCT FROM): equality where NULL equals NULL
     IsNot([Id; 2]),     // x IS NOT y (IS DISTINCT FROM)
+    Case([Id; 3]),      // CASE WHEN c THEN a ELSE b END (searched, one WHEN)
     Symbol(u64),
 }
 
@@ -93,6 +94,7 @@ impl Language for SqlLang {
             SqlLang::Remainder(c) => c,
             SqlLang::Is(c) => c,
             SqlLang::IsNot(c) => c,
+            SqlLang::Case(c) => c,
             SqlLang::Symbol(_) => &[],
         }
     }
@@ -127,6 +129,7 @@ impl Language for SqlLang {
             SqlLang::Remainder(c) => c,
             SqlLang::Is(c) => c,
             SqlLang::IsNot(c) => c,
+            SqlLang::Case(c) => c,
             SqlLang::Symbol(_) => &mut [],
         }
     }
@@ -299,6 +302,12 @@ impl FromOp for SqlLang {
                     .map_err(|_| format!("isnot: expected 2 children"))?;
                 Ok(SqlLang::IsNot(arr))
             }
+            "case" => {
+                let arr: [Id; 3] = children
+                    .try_into()
+                    .map_err(|_| format!("case: expected 3 children"))?;
+                Ok(SqlLang::Case(arr))
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -346,6 +355,7 @@ impl fmt::Display for SqlLang {
             SqlLang::Remainder(_) => write!(f, "rem"),
             SqlLang::Is(_) => write!(f, "is"),
             SqlLang::IsNot(_) => write!(f, "isnot"),
+            SqlLang::Case(_) => write!(f, "case"),
             SqlLang::Symbol(k) => write!(f, "{}", k),
         }
     }
@@ -593,6 +603,28 @@ fn sql_expr_to_recexpr_impl(
             rec.add(SqlLang::IsNot([l, r]))
         }
 
+        // A searched CASE with one WHEN. A missing ELSE is ELSE NULL. More WHENs, and the simple
+        // form CASE x WHEN ..., stay one opaque atom.
+        SqlExpr::Case {
+            operand: None,
+            conditions,
+            else_result,
+            ..
+        } if conditions.len() == 1 => {
+            let c = sql_expr_to_recexpr_impl(&conditions[0].condition, rec, symbols, counter, dedup, source_sql);
+            let a = sql_expr_to_recexpr_impl(&conditions[0].result, rec, symbols, counter, dedup, source_sql);
+            let null = SqlExpr::Value(Value::Null.into());
+            let b = sql_expr_to_recexpr_impl(
+                else_result.as_deref().unwrap_or(&null),
+                rec,
+                symbols,
+                counter,
+                dedup,
+                source_sql,
+            );
+            rec.add(SqlLang::Case([c, a, b]))
+        }
+
         SqlExpr::Nested(inner) => {
             // Parentheses are transparent
             sql_expr_to_recexpr_impl(inner, rec, symbols, counter, dedup, source_sql)
@@ -632,6 +664,17 @@ pub fn contains_row_value(expr: &SqlExpr) -> bool {
             high,
             ..
         } => contains_row_value(inner) || contains_row_value(low) || contains_row_value(high),
+        // A one-WHEN CASE is a node now, so the rules reach inside it.
+        SqlExpr::Case {
+            operand: None,
+            conditions,
+            else_result,
+            ..
+        } if conditions.len() == 1 => {
+            contains_row_value(&conditions[0].condition)
+                || contains_row_value(&conditions[0].result)
+                || else_result.as_deref().map_or(false, contains_row_value)
+        }
         // `(a, b) IS (c, d)` compares row values, and the IS rules write each side twice.
         SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
             contains_row_value(left) || contains_row_value(right)
@@ -711,6 +754,17 @@ pub fn compares_columns_of_unknown_collation(expr: &SqlExpr) -> bool {
         | SqlExpr::IsNotFalse(inner)
         | SqlExpr::IsUnknown(inner)
         | SqlExpr::IsNotUnknown(inner) => compares_columns_of_unknown_collation(inner),
+        // The rules reach the comparisons inside a one-WHEN CASE (it is a node now).
+        SqlExpr::Case {
+            operand: None,
+            conditions,
+            else_result,
+            ..
+        } if conditions.len() == 1 => {
+            compares_columns_of_unknown_collation(&conditions[0].condition)
+                || compares_columns_of_unknown_collation(&conditions[0].result)
+                || else_result.as_deref().map_or(false, compares_columns_of_unknown_collation)
+        }
         // IS picks its collation the way = does.
         SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
             ((mentions_a_column(left) && mentions_a_column(right))
@@ -937,6 +991,16 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
             Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
             Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
         ),
+        SqlLang::Case([c, a, b]) => SqlExpr::Case {
+            case_token: AttachedToken::empty(),
+            end_token: AttachedToken::empty(),
+            operand: None,
+            conditions: vec![CaseWhen {
+                condition: wrap_compound(recexpr_to_sql_expr_impl(expr, *c, symbols)),
+                result: wrap_compound(recexpr_to_sql_expr_impl(expr, *a, symbols)),
+            }],
+            else_result: Some(Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *b, symbols)))),
+        },
     }
 }
 
@@ -1593,6 +1657,7 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::Remainder(_) => SqlLang::Remainder([child_ids[0], child_ids[1]]),
         SqlLang::Is(_) => SqlLang::Is([child_ids[0], child_ids[1]]),
         SqlLang::IsNot(_) => SqlLang::IsNot([child_ids[0], child_ids[1]]),
+        SqlLang::Case(_) => SqlLang::Case([child_ids[0], child_ids[1], child_ids[2]]),
         SqlLang::Symbol(k) => SqlLang::Symbol(*k),
     }
 }
@@ -1712,6 +1777,13 @@ fn eval(
         SqlLang::NotEq([l, r]) => order_compare(expr, *l, *r, symbols, assignment, |o| {
             o != std::cmp::Ordering::Equal
         }),
+        SqlLang::Case([c, a, b]) => {
+            if truth_value(&eval(expr, *c, symbols, assignment)) == SqlValue::Bool(true) {
+                eval(expr, *a, symbols, assignment)
+            } else {
+                eval(expr, *b, symbols, assignment)
+            }
+        }
         // IS is = with NULL as an ordinary value: never NULL itself.
         SqlLang::Is([l, r]) | SqlLang::IsNot([l, r]) => {
             let lv = eval(expr, *l, symbols, assignment);
