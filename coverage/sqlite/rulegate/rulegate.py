@@ -121,12 +121,14 @@ def to_sql(tree, binding):
     # judged before anyone implements them.
     if op in EXTENSION:
         return EXTENSION[op].format(*args)
+    if op.startswith("fn:"):
+        return "%s(%s)" % (op[3:], ", ".join(args))
     raise ValueError("unknown operator " + op)
 
 
 def produces_value(tree):
     # A bare variable can be a column, which brings its affinity and collation to the comparison.
-    return isinstance(tree, str) or tree[0] in VALUE_OPS
+    return isinstance(tree, str) or tree[0] in VALUE_OPS or tree[0].startswith("fn:")
 
 
 # Literals carrying an explicit COLLATE: a constant behaves unlike a column in places (SQLite turns

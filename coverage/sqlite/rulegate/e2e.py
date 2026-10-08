@@ -48,6 +48,8 @@ class Gen:
             choices += ["case"]
         if "cast" in self.features:
             choices += ["cast"]
+        if "func" in self.features:
+            choices += ["func", "func"]
         k = self.r.choice(choices)
         a, b = self.value(d - 1), self.value(d - 1)
         if k == "arith":
@@ -72,6 +74,16 @@ class Gen:
             if form == 2:
                 return "(CASE %s WHEN %s THEN %s ELSE %s END)" % (self.leaf(), self.leaf(), a, b)
             return "(CASE WHEN %s THEN %s ELSE %s END)" % (self.pred(d - 1), a, b)
+        if k == "func":
+            f1 = ["abs", "length", "lower", "upper", "typeof", "trim", "ltrim", "rtrim", "hex", "quote",
+                  "unicode", "likely", "unlikely", "round", "sign", "octet_length"]
+            f2 = ["instr", "substr", "max", "min", "round", "trim", "ifnull", "glob", "like", "likelihood"]
+            if self.r.random() < 0.6:
+                return "%s(%s)" % (self.r.choice(f1), a)
+            f = self.r.choice(f2)
+            if f == "likelihood":
+                return "likelihood(%s, 0.5)" % a
+            return "%s(%s, %s)" % (f, a, b)
         if k == "cast":
             return "CAST(%s AS %s)" % (a, self.r.choice(["INTEGER", "REAL", "TEXT", "NUMERIC", "BLOB"]))
         raise AssertionError(k)

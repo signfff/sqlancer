@@ -70,6 +70,11 @@ pub enum SqlLang {
     In3([Id; 4]),       // x IN (a, b, c); NOT IN is not(inN), longer lists stay atoms
     Like([Id; 2]),      // x LIKE p, no ESCAPE
     Glob([Id; 2]),      // x GLOB p
+    // Any other plain call of a deterministic function with one to three arguments; the u32 is the
+    // function name interned by fn_id. Patterns spell it fn:name, e.g. (fn:lower ?x).
+    Call1(u32, [Id; 1]),
+    Call2(u32, [Id; 2]),
+    Call3(u32, [Id; 3]),
     Symbol(u64),
 }
 
@@ -116,6 +121,9 @@ impl Language for SqlLang {
             SqlLang::In3(c) => c,
             SqlLang::Like(c) => c,
             SqlLang::Glob(c) => c,
+            SqlLang::Call1(_, c) => c,
+            SqlLang::Call2(_, c) => c,
+            SqlLang::Call3(_, c) => c,
             SqlLang::CastInt(c) => c,
             SqlLang::CastReal(c) => c,
             SqlLang::CastText(c) => c,
@@ -163,6 +171,9 @@ impl Language for SqlLang {
             SqlLang::In3(c) => c,
             SqlLang::Like(c) => c,
             SqlLang::Glob(c) => c,
+            SqlLang::Call1(_, c) => c,
+            SqlLang::Call2(_, c) => c,
+            SqlLang::Call3(_, c) => c,
             SqlLang::CastInt(c) => c,
             SqlLang::CastReal(c) => c,
             SqlLang::CastText(c) => c,
@@ -418,6 +429,15 @@ impl FromOp for SqlLang {
                     .map_err(|_| format!("glob: expected 2 children"))?;
                 Ok(SqlLang::Glob(arr))
             }
+            name if name.starts_with("fn:") => {
+                let f = fn_id(&name[3..]);
+                match children.len() {
+                    1 => Ok(SqlLang::Call1(f, [children[0]])),
+                    2 => Ok(SqlLang::Call2(f, [children[0], children[1]])),
+                    3 => Ok(SqlLang::Call3(f, [children[0], children[1], children[2]])),
+                    n => Err(format!("{}: {} arguments, one to three supported", name, n)),
+                }
+            }
             "rem" => {
                 let arr: [Id; 2] = children
                     .try_into()
@@ -473,6 +493,7 @@ impl fmt::Display for SqlLang {
             SqlLang::In3(_) => write!(f, "in3"),
             SqlLang::Like(_) => write!(f, "like"),
             SqlLang::Glob(_) => write!(f, "glob"),
+            SqlLang::Call1(n, _) | SqlLang::Call2(n, _) | SqlLang::Call3(n, _) => write!(f, "fn:{}", fn_name(*n)),
             SqlLang::CastInt(_) => write!(f, "cast_int"),
             SqlLang::CastReal(_) => write!(f, "cast_real"),
             SqlLang::CastText(_) => write!(f, "cast_text"),
@@ -747,6 +768,15 @@ fn sql_expr_to_recexpr_impl(
                     let a = child(args[1]);
                     let b = child(args[2]);
                     rec.add(SqlLang::Case([c, a, b]))
+                }
+                (other, 1..=3) if !NONDETERMINISTIC_FUNCTIONS.contains(&other) => {
+                    let f = fn_id(other);
+                    let ids: Vec<Id> = args.iter().map(|a| child(a)).collect();
+                    rec.add(match ids.len() {
+                        1 => SqlLang::Call1(f, [ids[0]]),
+                        2 => SqlLang::Call2(f, [ids[0], ids[1]]),
+                        _ => SqlLang::Call3(f, [ids[0], ids[1], ids[2]]),
+                    })
                 }
                 _ => make_symbol(expr, rec, symbols, counter, dedup, source_sql),
             }
@@ -1069,6 +1099,31 @@ fn in_list(expr: &RecExpr<SqlLang>, x: Id, items: &[Id], symbols: &SymbolTable) 
     }
 }
 
+/// Functions whose answer can change between two calls with the same arguments: a rule that writes a
+/// call twice, or moves it, would ask a different question. They stay atoms.
+const NONDETERMINISTIC_FUNCTIONS: [&str; 10] = [
+    "random", "randomblob", "changes", "total_changes", "last_insert_rowid", "sqlite_offset",
+    "date", "time", "datetime", "julianday",
+];
+
+static FN_NAMES: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// The interned id of a function name (lower case).
+pub fn fn_id(name: &str) -> u32 {
+    let name = name.to_ascii_lowercase();
+    let mut names = FN_NAMES.lock().unwrap();
+    if let Some(i) = names.iter().position(|n| *n == name) {
+        return i as u32;
+    }
+    names.push(name);
+    (names.len() - 1) as u32
+}
+
+fn fn_name(id: u32) -> String {
+    FN_NAMES.lock().unwrap()[id as usize].clone()
+}
+
 fn call(name: &str, args: Vec<SqlExpr>) -> SqlExpr {
     use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, ObjectName};
     SqlExpr::Function(Function {
@@ -1301,6 +1356,16 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
             pattern: Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *p, symbols))),
             escape_char: None,
         },
+        SqlLang::Call1(n, [a]) => call(&fn_name(*n), vec![recexpr_to_sql_expr_impl(expr, *a, symbols)]),
+        SqlLang::Call2(n, [a, b]) => call(&fn_name(*n), vec![
+            recexpr_to_sql_expr_impl(expr, *a, symbols),
+            recexpr_to_sql_expr_impl(expr, *b, symbols),
+        ]),
+        SqlLang::Call3(n, [a, b, c]) => call(&fn_name(*n), vec![
+            recexpr_to_sql_expr_impl(expr, *a, symbols),
+            recexpr_to_sql_expr_impl(expr, *b, symbols),
+            recexpr_to_sql_expr_impl(expr, *c, symbols),
+        ]),
         SqlLang::Coalesce([a, b]) => call("coalesce", vec![
             recexpr_to_sql_expr_impl(expr, *a, symbols),
             recexpr_to_sql_expr_impl(expr, *b, symbols),
@@ -2087,6 +2152,9 @@ fn make_node(template: &SqlLang, child_ids: &[Id]) -> SqlLang {
         SqlLang::In3(_) => SqlLang::In3([child_ids[0], child_ids[1], child_ids[2], child_ids[3]]),
         SqlLang::Like(_) => SqlLang::Like([child_ids[0], child_ids[1]]),
         SqlLang::Glob(_) => SqlLang::Glob([child_ids[0], child_ids[1]]),
+        SqlLang::Call1(n, _) => SqlLang::Call1(*n, [child_ids[0]]),
+        SqlLang::Call2(n, _) => SqlLang::Call2(*n, [child_ids[0], child_ids[1]]),
+        SqlLang::Call3(n, _) => SqlLang::Call3(*n, [child_ids[0], child_ids[1], child_ids[2]]),
         SqlLang::CastInt(_) => SqlLang::CastInt([child_ids[0]]),
         SqlLang::CastReal(_) => SqlLang::CastReal([child_ids[0]]),
         SqlLang::CastText(_) => SqlLang::CastText([child_ids[0]]),
@@ -2242,6 +2310,18 @@ fn eval(
                 let like = matches!(&expr[root], SqlLang::Like(_));
                 SqlValue::Bool(pattern_match(&sqlvalue_to_text(&pv), &sqlvalue_to_text(&xv), like))
             }
+        }
+        // Not modelled: the evaluator only backs up validation, and the rules over these nodes are
+        // checked against SQLite. A value that depends on the name and the arguments alone keeps
+        // two spellings of the same call equal and different calls apart.
+        SqlLang::Call1(..) | SqlLang::Call2(..) | SqlLang::Call3(..) => {
+            let node = &expr[root];
+            let args: Vec<String> = node
+                .children()
+                .iter()
+                .map(|c| format!("{:?}", eval(expr, *c, symbols, assignment)))
+                .collect();
+            SqlValue::Text(format!("{}({})", node, args.join(",")))
         }
         SqlLang::Coalesce([a, b]) => match eval(expr, *a, symbols, assignment) {
             SqlValue::Null => eval(expr, *b, symbols, assignment),
