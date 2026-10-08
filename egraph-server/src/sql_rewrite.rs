@@ -772,6 +772,7 @@ const OPERAND_SWAPPING_RULES: &[&str] = &[
     "gteq-to-lteq",
     "lteq-to-gteq",
     "is-sym",
+    "isnot-sym",
 ];
 
 //  RecExpr<SqlLang> ?sqlparser Expr
@@ -1382,6 +1383,34 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("is-expand"; "(is ?x ?y)" => "(or (and (isnull ?x) (isnull ?y)) (and (and (isnotnull ?x) (isnotnull ?y)) (= ?x ?y)))"),
         rewrite!("isnot-to-not-is"; "(isnot ?x ?y)" => "(not (is ?x ?y))"),
         rewrite!("is-sym"; "(is ?x ?y)" => "(is ?y ?x)"),
+        //  Agent round 2 (IS / IS NOT), same three checks. not-isnot-to-is and is-sym-bool were
+        //  proposed too and left out: the rules above already reach them from their lhs.
+        rewrite!("is-to-not-isnot"; "(is ?x ?y)" => "(not (isnot ?x ?y))"),
+        rewrite!("not-is-to-isnot"; "(not (is ?x ?y))" => "(isnot ?x ?y)"),
+        rewrite!("istrue-eq-to-is"; "(istrue (= ?x ?y))" => "(and (is ?x ?y) (isnotnull ?x))"),
+        rewrite!("is-notnull-to-istrue-eq"; "(and (is ?x ?y) (isnotnull ?x))" => "(istrue (= ?x ?y))"),
+        rewrite!("isfalse-eq-to-isnot"; "(isfalse (= ?x ?y))" => "(and (isnot ?x ?y) (and (isnotnull ?x) (isnotnull ?y)))"),
+        rewrite!("istrue-noteq-to-isnot"; "(istrue (<> ?x ?y))" => "(and (isnot ?x ?y) (and (isnotnull ?x) (isnotnull ?y)))"),
+        rewrite!("isnottrue-eq-to-isnot"; "(isnottrue (= ?x ?y))" => "(or (isnot ?x ?y) (isnull ?x))"),
+        rewrite!("isnotfalse-eq-to-is"; "(isnotfalse (= ?x ?y))" => "(or (is ?x ?y) (or (isnull ?x) (isnull ?y)))"),
+        rewrite!("is-to-istrue-eq-or-bothnull"; "(is ?x ?y)" => "(or (istrue (= ?x ?y)) (and (isnull ?x) (isnull ?y)))"),
+        rewrite!("is-to-nullmatch"; "(is ?x ?y)" => "(and (isnotfalse (= ?x ?y)) (is (isnull ?x) (isnull ?y)))"),
+        rewrite!("isnot-to-nullmismatch"; "(isnot ?x ?y)" => "(or (isfalse (= ?x ?y)) (isnot (isnull ?x) (isnull ?y)))"),
+        rewrite!("isnot-to-isnottrue-eq"; "(isnot ?x ?y)" => "(and (isnottrue (= ?x ?y)) (or (isnotnull ?x) (isnotnull ?y)))"),
+        rewrite!("is-isnull-pair"; "(is (isnull ?x) (isnull ?y))" => "(or (and (isnull ?x) (isnull ?y)) (and (isnotnull ?x) (isnotnull ?y)))"),
+        rewrite!("is-to-eq-nonnull-operands"; "(is (istrue ?a) (istrue ?b))" => "(= (istrue ?a) (istrue ?b))"),
+        rewrite!("isnot-to-noteq-nonnull-operands"; "(isnot (isnull ?a) (isnull ?b))" => "(<> (isnull ?a) (isnull ?b))"),
+        rewrite!("is-not-cmp"; "(is (not (= ?a ?b)) (not (= ?c ?d)))" => "(is (= ?a ?b) (= ?c ?d))"),
+        rewrite!("istrue-is"; "(istrue (is ?x ?y))" => "(is ?x ?y)"),
+        rewrite!("isfalse-is"; "(isfalse (is ?x ?y))" => "(isnot ?x ?y)"),
+        rewrite!("isnottrue-is"; "(isnottrue (is ?x ?y))" => "(isnot ?x ?y)"),
+        rewrite!("istrue-isnot"; "(istrue (isnot ?x ?y))" => "(isnot ?x ?y)"),
+        rewrite!("bothnull-to-is"; "(and (isnull ?x) (isnull ?y))" => "(and (isnull ?x) (is ?x ?y))"),
+        rewrite!("is-isnull-to-bothnull"; "(and (isnull ?x) (is ?x ?y))" => "(and (isnull ?x) (isnull ?y))"),
+        rewrite!("eithernotnull-to-isnot"; "(or (isnotnull ?x) (isnotnull ?y))" => "(or (isnotnull ?x) (isnot ?x ?y))"),
+        rewrite!("isnull-via-is-reflexive"; "(isnull ?x)" => "(is (= ?x ?x) (not (= ?x ?x)))"),
+        rewrite!("isnotnull-via-isnot-reflexive"; "(isnotnull ?x)" => "(isnot (= ?x ?x) (not (= ?x ?x)))"),
+        rewrite!("isnot-sym"; "(isnot ?x ?y)" => "(isnot ?y ?x)"),
         //  Modulo: no direct rewrite rules (x % 1 ?0 requires constant detection).
         //          Remainder is still useful as a non-opaque node ?it allows
         //          surrounding AND/OR rules to fire instead of treating the

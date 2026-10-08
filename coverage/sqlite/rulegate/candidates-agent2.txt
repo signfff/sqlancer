@@ -1,0 +1,65 @@
+# Candidate rules involving is / isnot (agent1, round 2). Nothing here has been run yet: every rule should go through rulegate.
+# Facts used throughout:
+#   - x IS y uses exactly the affinity and collation of x = y with the same operand order. NULL IS NULL is 1, NULL IS non-NULL is 0, and the result is never NULL.
+#   - Every rule below keeps each (= ?x ?y), (<> ?x ?y) and (is ?x ?y) in its original operand order. The only moves are into IS/= between
+#     0/1/NULL integer results, where affinity and collation cannot change anything, because collation only affects TEXT and those results are not TEXT.
+#   - Rules that use ?x twice change results when ?x is non-deterministic, as in the earlier rounds.
+
+not-isnot-to-is ; (not (isnot ?x ?y)) => (is ?x ?y)
+#   IS NOT is never NULL, so NOT gives the exact 0/1 complement, which is IS. The existing rules cannot reach this, because they would need a double NOT on is.
+is-to-not-isnot ; (is ?x ?y) => (not (isnot ?x ?y))
+#   Same argument in the other direction. isnot-to-not-is goes isnot -> not is, so this direction is new.
+not-is-to-isnot ; (not (is ?x ?y)) => (isnot ?x ?y)
+#   IS is never NULL, so NOT gives exactly its complement. This may duplicate isnot-to-not-is if that rule was added in both directions.
+istrue-eq-to-is ; (istrue (= ?x ?y)) => (and (is ?x ?y) (isnotnull ?x))
+#   If both are non-NULL, IS equals the value of =. If x is NULL, both sides are 0. If only y is NULL, IS is 0. The comparison keeps its operand order.
+is-notnull-to-istrue-eq ; (and (is ?x ?y) (isnotnull ?x)) => (istrue (= ?x ?y))
+#   The reverse of istrue-eq-to-is. Both sides are always 0/1.
+isfalse-eq-to-isnot ; (isfalse (= ?x ?y)) => (and (isnot ?x ?y) (and (isnotnull ?x) (isnotnull ?y)))
+#   = is false only when both are non-NULL and unequal. In that case IS NOT gives the same 0/1. Any NULL makes both sides 0.
+istrue-noteq-to-isnot ; (istrue (<> ?x ?y)) => (and (isnot ?x ?y) (and (isnotnull ?x) (isnotnull ?y)))
+#   <> is true only when both are non-NULL and unequal under the same collation/affinity that IS NOT uses.
+isnottrue-eq-to-isnot ; (isnottrue (= ?x ?y)) => (or (isnot ?x ?y) (isnull ?x))
+#   Both non-NULL gives the unequal flag on both sides. x NULL gives 1 on both sides. If only y is NULL, the LHS is 1 (NULL is not true) and IS NOT is 1.
+isnotfalse-eq-to-is ; (isnotfalse (= ?x ?y)) => (or (is ?x ?y) (or (isnull ?x) (isnull ?y)))
+#   Both non-NULL gives the equal flag on both sides. Any NULL makes = NULL, so the LHS is 1, and the RHS is 1 through its isnull disjuncts.
+is-to-istrue-eq-or-bothnull ; (is ?x ?y) => (or (istrue (= ?x ?y)) (and (isnull ?x) (isnull ?y)))
+#   Not the same as is-expand: it has no notnull guards and uses istrue. Both NULL gives 0 OR 1 = 1. One NULL gives 0 OR 0. Both non-NULL gives the value of =.
+is-to-nullmatch ; (is ?x ?y) => (and (isnotfalse (= ?x ?y)) (is (isnull ?x) (isnull ?y)))
+#   Both non-NULL gives the value of = AND 1. Both NULL gives 1 AND 1. One NULL gives 1 AND (0 IS 1)=0. The inner IS compares 0/1 integers, so collation does not matter.
+isnot-to-nullmismatch ; (isnot ?x ?y) => (or (isfalse (= ?x ?y)) (isnot (isnull ?x) (isnull ?y)))
+#   Both non-NULL gives (x<>y) OR 0. Both NULL gives 0 OR 0. One NULL gives 0 OR 1. This is the complement of is-to-nullmatch.
+isnot-to-isnottrue-eq ; (isnot ?x ?y) => (and (isnottrue (= ?x ?y)) (or (isnotnull ?x) (isnotnull ?y)))
+#   Both non-NULL gives (x<>y) AND 1. Both NULL gives 1 AND 0 = 0. One NULL gives 1 AND 1 = 1.
+is-isnull-pair ; (is (isnull ?x) (isnull ?y)) => (or (and (isnull ?x) (isnull ?y)) (and (isnotnull ?x) (isnotnull ?y)))
+#   Both operands of IS are non-NULL 0/1 integers, so IS just means "same nullness". Both sides are 0/1. Add the reverse direction too.
+is-to-eq-nonnull-operands ; (is (istrue ?a) (istrue ?b)) => (= (istrue ?a) (istrue ?b))
+#   IS and = differ only on NULL, and IS TRUE is never NULL. The operands are integers, so affinity and collation have no effect. The same rule works for isnull/isnotnull/isfalse/isnottrue/isnotfalse/is/isnot operands, and in reverse.
+isnot-to-noteq-nonnull-operands ; (isnot (isnull ?a) (isnull ?b)) => (<> (isnull ?a) (isnull ?b))
+#   The same argument for IS NOT versus <>, with operands that are never NULL.
+is-sym-bool ; (is (= ?a ?b) (= ?c ?d)) => (is (= ?c ?d) (= ?a ?b))
+#   Both operands are 0/1/NULL integers, so even if an explicit COLLATE inside a or b gives the outer IS a collation, it has no effect on integers. Swapping is safe without the guard.
+#   SLIGHTLY UNSURE: this assumes a comparison expression carries no TEXT affinity into the outer comparison. Rulegate should test it with an explicit COLLATE and TEXT columns inside.
+is-not-cmp ; (is (not (= ?a ?b)) (not (= ?c ?d))) => (is (= ?a ?b) (= ?c ?d))
+#   NOT is a bijection on {0,1,NULL} (0<->1, NULL<->NULL), and = only produces those values, so null-safe equality is preserved. With arbitrary operands this would be UNSOUND, because NOT 2 and NOT 3 are both 0.
+istrue-is ; (istrue (is ?x ?y)) => (is ?x ?y)
+#   IS is always 0 or 1, and IS TRUE of 0/1 is the identity, value for value.
+isfalse-is ; (isfalse (is ?x ?y)) => (isnot ?x ?y)
+#   IS FALSE of a 0/1 value is its complement, and IS NOT is the complement of IS.
+isnottrue-is ; (isnottrue (is ?x ?y)) => (isnot ?x ?y)
+#   For a 0/1 value, IS NOT TRUE and IS FALSE agree, so this gives IS NOT.
+istrue-isnot ; (istrue (isnot ?x ?y)) => (isnot ?x ?y)
+#   IS NOT is always 0 or 1, so IS TRUE leaves it unchanged. isfalse-isnot => is follows by the same argument.
+bothnull-to-is ; (and (isnull ?x) (isnull ?y)) => (and (isnull ?x) (is ?x ?y))
+#   When x is NULL, x IS y equals isnull(y), and collation cannot matter because one side is NULL. When x is not NULL, both sides are 0.
+is-isnull-to-bothnull ; (and (isnull ?x) (is ?x ?y)) => (and (isnull ?x) (isnull ?y))
+#   The reverse of bothnull-to-is.
+eithernotnull-to-isnot ; (or (isnotnull ?x) (isnotnull ?y)) => (or (isnotnull ?x) (isnot ?x ?y))
+#   x non-NULL gives 1 on both sides. x NULL gives NULL IS NOT y, which is isnotnull(y).
+isnull-via-is-reflexive ; (isnull ?x) => (is (= ?x ?x) (not (= ?x ?x)))
+#   For non-NULL x, x=x is 1, because comparison is reflexive under every built-in collation and for REAL (stored values cannot be NaN), so the RHS is 1 IS 0 = 0. For NULL x, NULL IS NULL = 1.
+#   UNSURE: this relies on x=x always being 1 for a non-NULL x, including TEXT under a column affinity and BLOBs. It also breaks for non-deterministic x.
+isnotnull-via-isnot-reflexive ; (isnotnull ?x) => (isnot (= ?x ?x) (not (= ?x ?x)))
+#   The complement of the previous rule: non-NULL gives 1 IS NOT 0 = 1, and NULL gives NULL IS NOT NULL = 0. It has the same uncertainty about reflexivity.
+isnot-sym ; (isnot ?x ?y) => (isnot ?y ?x)
+#   UNSOUND WITHOUT A GUARD: it fails for the same reason as is-sym (different collations or affinities). Put it behind the existing collation gate.

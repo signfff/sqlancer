@@ -119,6 +119,18 @@ fn preprocess_unquoted_sql(input: &str) -> String {
         })
         .to_string();
 
+    // SQLite allows an empty list, `x IN ()`, and sqlparser does not: it was the commonest refusal
+    // of the 2026-10-07 long run (2265 logged). An empty subquery is the same set - x IN () is 0
+    // and x NOT IN () is 1 for every x, NULL included, measured both ways.
+    // GLOB is SQLite's; sqlparser has no such operator and refused every query with one. It does
+    // have SIMILAR TO, which SQLite has not and which sits at the same precedence as LIKE, so GLOB
+    // travels under that name and restore_glob gives it back on the way out.
+    static RE_GLOB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bGLOB\b"#).unwrap());
+    let s = RE_GLOB.replace_all(&s, "SIMILAR TO").to_string();
+
+    static RE_EMPTY_IN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bIN\s*\(\s*\)"#).unwrap());
+    let s = RE_EMPTY_IN.replace_all(&s, "IN (SELECT 1 WHERE 0)").to_string();
+
     static RE_0X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\b0X([0-9a-fA-F]+)"#).unwrap());
     let s = RE_0X.replace_all(&s, "0x$1").to_string();
 
@@ -224,7 +236,8 @@ fn sqlite_binding(expr: &SqlExpr) -> Option<u8> {
         | SqlExpr::InSubquery { .. }
         | SqlExpr::Between { .. }
         | SqlExpr::Like { .. }
-        | SqlExpr::ILike { .. } => 4,
+        | SqlExpr::ILike { .. }
+        | SqlExpr::SimilarTo { .. } => 4,
         _ => return None,
     })
 }
@@ -259,7 +272,8 @@ fn groups_like_sqlite(statement: &Statement) -> bool {
                 operand_ok(p, left, false) && operand_ok(p, right, true)
             }
             (Some(p), SqlExpr::Like { expr, pattern, .. })
-            | (Some(p), SqlExpr::ILike { expr, pattern, .. }) => {
+            | (Some(p), SqlExpr::ILike { expr, pattern, .. })
+            | (Some(p), SqlExpr::SimilarTo { expr, pattern, .. }) => {
                 operand_ok(p, expr, false) && operand_ok(p, pattern, true)
             }
             (Some(p), SqlExpr::Between { expr, low, high, .. }) => {
@@ -420,6 +434,13 @@ fn generate_query_variants(
 /// Only hex digits that really appear as `0x...` in the source are restored, and only when the
 /// source does not also contain the same digits spelled as a blob literal, so a genuine `X'..'`
 /// is never rewritten.
+/// Undoes the GLOB -> SIMILAR TO spelling of preprocessing, outside quoted text.
+fn restore_glob(rendered: &str) -> String {
+    static RE_SIMILAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\bSIMILAR TO\b"#).unwrap());
+    let (masked, quoted) = mask_quoted(rendered);
+    unmask_quoted(&RE_SIMILAR.replace_all(&masked, "GLOB"), &quoted)
+}
+
 fn restore_integer_hex(rendered: &str, source_sql: &str) -> String {
     if !rendered.contains("X'") {
         return rendered.to_string();
@@ -517,7 +538,7 @@ fn generate_select_variants(
     Ok(variant_queries
         .into_iter()
         .filter_map(|variant_query| {
-            let s = restore_integer_hex(&variant_query.to_string(), source_sql);
+            let s = restore_glob(&restore_integer_hex(&variant_query.to_string(), source_sql));
             if s == original_str {
                 None
             } else {
@@ -604,6 +625,8 @@ fn usage(rules_path: &str, queries_path: &str) {
     let mut added = vec![0usize; candidates.len()];
     let mut usable = 0usize;
     let mut unsaturated = 0usize;
+    let mut convertible = 0usize;
+    let mut fires = vec![0usize; candidates.len()];
     for line in std::fs::read_to_string(queries_path).expect("cannot read queries").lines() {
         let query_str = preprocess_sqlite_sql(line.trim());
         let Ok(statements) = Parser::parse_sql(&GenericDialect {}, &query_str) else { continue };
@@ -615,6 +638,15 @@ fn usage(rules_path: &str, queries_path: &str) {
             continue;
         }
         let allow_swap = !sql_rewrite::compares_columns_of_unknown_collation(selection);
+        // Whether the rule fires at all under the server's own budget - the question a long run
+        // asks - counted on every query, saturated or not.
+        let (production, _) = sql_rewrite::perform_rewrites(&rec, 20, allow_swap);
+        for (i, (_, rule)) in candidates.iter().enumerate() {
+            if !rule.search(&production).is_empty() {
+                fires[i] += 1;
+            }
+        }
+        convertible += 1;
         // Saturated to a fixed point, not to the server's budget: on an e-graph the current rules
         // could still grow, a redundant candidate also "adds" something, which measured 500 of 2771
         // queries for rules --novelty proves derivable.
@@ -646,11 +678,14 @@ fn usage(rules_path: &str, queries_path: &str) {
         }
     }
     println!(
-        "{} base queries saturated and counted; {} did not saturate within the limits and were skipped",
-        usable, unsaturated
+        "{} queries converted; fires = matches under the server budget on all of them; matched / new          equalities = on the {} that saturated ({} did not)",
+        convertible, usable, unsaturated
     );
     for (i, (name, _)) in candidates.iter().enumerate() {
-        println!("{:<34} matched {:>5}  new equalities {:>5}", name, matched[i], added[i]);
+        println!(
+            "{:<34} fires {:>5}  matched {:>5}  new equalities {:>5}",
+            name, fires[i], matched[i], added[i]
+        );
     }
 }
 

@@ -14,6 +14,7 @@ import json
 import random
 import sqlite3
 import sys
+import time
 import urllib.request
 from collections import Counter
 
@@ -136,13 +137,16 @@ def main():
         if err:
             stats["original errors"] += 1
             continue
+        t = time.perf_counter()
         vs, refusal = variants(args.url, sql, args.max_variants)
+        stats["server ms"] += int((time.perf_counter() - t) * 1000)
         if refusal:
             stats["refused: " + refusal.split(":")[0][:60]] += 1
             continue
         stats["queries with variants" if vs else "queries without variants"] += 1
         for v in vs:
             stats["variants"] += 1
+            stats["variant chars"] += len(v)
             got, verr = rows(db, v)
             if verr:
                 stats["variant errors"] += 1
@@ -151,6 +155,10 @@ def main():
                 mismatches.append({"original": sql, "variant": v, "expected": expected, "got": got})
     for k, v in sorted(stats.items()):
         print("%6d  %s" % (v, k))
+    if stats["variants"]:
+        print("%6.1f  variants per query, %.0f chars per variant, %.0f ms per request" % (
+            stats["variants"] / max(1, args.n - sum(v for k, v in stats.items() if k.startswith("refused"))),
+            stats["variant chars"] / stats["variants"], stats["server ms"] / args.n))
     print("%6d  MISMATCHES" % len(mismatches))
     for m in mismatches[:10]:
         print("--\n%s\n%s\n%s vs %s" % (m["original"], m["variant"], m["expected"], m["got"]))

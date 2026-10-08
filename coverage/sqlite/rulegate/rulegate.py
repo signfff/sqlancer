@@ -36,7 +36,7 @@ EXPLICIT = "COLL"  # (vN.c_text COLLATE NOCASE)
 SCHEMA = ("CREATE TABLE v(c_int INTEGER, c_real REAL, c_text TEXT, c_blob BLOB, c_num NUMERIC, c_any, "
           "c_nocase TEXT COLLATE NOCASE, c_rtrim TEXT COLLATE RTRIM)")
 
-OPERAND_SWAPPING = {"eq-sym", "noteq-sym", "gt-to-lt", "lt-to-gt", "gteq-to-lteq", "lteq-to-gteq", "is-sym"}
+OPERAND_SWAPPING = {"eq-sym", "noteq-sym", "gt-to-lt", "lt-to-gt", "gteq-to-lteq", "lteq-to-gteq", "is-sym", "isnot-sym"}
 
 BINARY = {"and": "AND", "or": "OR", "=": "=", "<>": "<>", "<": "<", ">": ">", "<=": "<=", ">=": ">=",
           "+": "+", "-": "-", "*": "*", "/": "/", "rem": "%", "concat": "||", "bitand": "&", "bitor": "|"}
