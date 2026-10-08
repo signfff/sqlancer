@@ -1,0 +1,115 @@
+# Candidate rules, cross-node sweep (agent1, round 9). Nothing here has been run yet: every rule should go through rulegate.
+# Assumptions: the server guard holds (no explicit COLLATE below a value node). All rules keep value, affinity and implicit (column) collation.
+# "Boolean-valued" below means a node whose value is always 0/1/NULL: comparisons, is/isnot, isnull family, istrue family, and/or/not, between, like/glob, in*.
+# The 3-valued laws (absorption, idempotence) hold on such values; they failed earlier only for arbitrary values.
+# Where a rule is shown for one comparison operator, "and the other operators" means the same proof works verbatim, keeping the operand order.
+
+## Partial-index and NOT NULL shapes (adding or removing IS NOT NULL under a truth test)
+
+istrue-lt-notnull ; (istrue (< ?x ?y)) => (and (< ?x ?y) (and (isnotnull ?x) (isnotnull ?y)))
+#   Both non-NULL: (< x y) is 0/1, AND 1 gives the same value. Any NULL: the RHS is NULL AND 0 = 0, which equals IS TRUE of NULL. This adds "x IS NOT NULL" terms that can make a partial index usable.
+#   The same rule works for = <> <= > >=.
+istrue-eq-notnull ; (istrue (= ?x ?y)) => (and (= ?x ?y) (and (isnotnull ?x) (isnotnull ?y)))
+#   Same proof as istrue-lt-notnull.
+istrue-like-notnull ; (istrue (like ?x ?p)) => (and (like ?x ?p) (and (isnotnull ?x) (isnotnull ?p)))
+#   LIKE is NULL iff an operand is NULL, so the istrue-lt-notnull proof applies. Both IS NOT NULL terms are needed: with only isnotnull(x), a NULL p would give NULL instead of 0. The same rule works for glob.
+notnull-absorbed-by-istrue-eq ; (and (isnotnull ?x) (istrue (= ?x ?y))) => (istrue (= ?x ?y))
+#   x = y being true implies x is non-NULL. If x is NULL, both sides are 0. Both sides are 0/1. The same rule works for isnotnull(?y), for every comparison operator, and for like.
+
+## Range vs equality: redundant comparison pairs over the same operands (same operand order, so the same affinity and collation)
+
+lt-and-ne ; (and (< ?x ?y) (<> ?x ?y)) => (< ?x ?y)
+#   If x<y is true, then x<>y is true, giving 1. If false, AND gives 0. If either operand is NULL, both comparisons are NULL, giving NULL.
+le-and-ne ; (and (<= ?x ?y) (<> ?x ?y)) => (< ?x ?y)
+#   x<y gives 1 AND 1. x=y gives 1 AND 0 = 0. x>y gives 0. NULL gives NULL. The same rule works for (and (>= ?x ?y) (<> ?x ?y)) => (> ?x ?y).
+lt-or-ne ; (or (< ?x ?y) (<> ?x ?y)) => (<> ?x ?y)
+#   x<y implies x<>y. Otherwise OR adds nothing (0 OR v = v), and NULL gives NULL OR NULL.
+lt-and-le ; (and (< ?x ?y) (<= ?x ?y)) => (< ?x ?y)
+#   < implies <=. If < is false, AND gives 0 regardless. NULL gives NULL.
+lt-or-le ; (or (< ?x ?y) (<= ?x ?y)) => (<= ?x ?y)
+#   < implies <=, so OR gives <=. NULL gives NULL.
+eq-and-le ; (and (= ?x ?y) (<= ?x ?y)) => (= ?x ?y)
+#   = implies <=. If = is false, the result is 0. NULL gives NULL. The same rule works for >=.
+ge-and-ne ; (and (>= ?x ?y) (<> ?x ?y)) => (> ?x ?y)
+#   This is the mirror of le-and-ne. It is written separately because operand swaps are guarded.
+between-and-lower ; (and (between ?x ?lo ?hi) (>= ?x ?lo)) => (between ?x ?lo ?hi)
+#   BETWEEN is (x>=lo AND x<=hi), and (A AND B) AND A = A AND B holds for 0/1/NULL A and B. The same rule works for (<= ?x ?hi).
+isfalse-between ; (isfalse (between ?x ?lo ?hi)) => (or (istrue (< ?x ?lo)) (istrue (> ?x ?hi)))
+#   BETWEEN is false iff x>=lo is false or x<=hi is false, that is, iff x<lo is true or x>hi is true. The operand order (x first) is kept, and both sides are 0/1.
+
+## Absorption on boolean-valued operands
+
+absorb-or-lt ; (or (< ?x ?y) (and (< ?x ?y) ?q)) => (< ?x ?y)
+#   3-valued absorption, with p = x<y in {0,1,NULL}. p=NULL gives NULL OR (NULL AND q) = NULL for any q. p=0 gives 0 OR 0. p=1 gives 1. The same rule works for every boolean-valued p.
+absorb-and-lt ; (and (< ?x ?y) (or (< ?x ?y) ?q)) => (< ?x ?y)
+#   p=NULL gives NULL AND (NULL OR q), which is NULL AND (1 or NULL) = NULL. p=0 gives 0. p=1 gives 1 AND 1. The same rule works for every boolean-valued p.
+absorb-or-is ; (or (is ?x ?y) (and (is ?x ?y) ?q)) => (is ?x ?y)
+#   IS is 0/1, and absorption holds. The same rule works for isnull/istrue/like/in*.
+
+## CASE in conditions
+
+case-lt-branches-to-andor ; (case ?c (< ?x ?y) (< ?z ?w)) => (or (and (istrue ?c) (< ?x ?y)) (and (isnottrue ?c) (< ?z ?w)))
+#   The branches are 0/1/NULL. c true gives v OR 0 = v, with NULL kept. c not true gives 0 OR w. This turns the CASE into an OR, which the planner can use for OR-optimisation. The same rule works for any boolean-valued branches.
+case-eq-branches-to-andor ; (case ?c (= ?x ?y) (= ?x ?z)) => (or (and (istrue ?c) (= ?x ?y)) (and (isnottrue ?c) (= ?x ?z)))
+#   Same proof as case-lt-branches-to-andor. The shape can become two indexable equality terms on x.
+and-istrue-case ; (and (istrue ?c) (case ?c ?a ?b)) => (and (istrue ?c) ?a)
+#   c true gives 1 AND a on both sides. c not true gives 0 AND anything = 0 on both sides. The CASE disappears.
+and-isnottrue-case ; (and (isnottrue ?c) (case ?c ?a ?b)) => (and (isnottrue ?c) ?b)
+#   Same proof for the ELSE branch.
+istrue-case-same ; (istrue (case ?c ?a ?a)) => (istrue ?a)
+#   The selected value is always a, and a truth test ignores the lost affinity. The same rule works for not/isnull/isnotnull/isfalse.
+case-cond-notnot ; (case ?c ?a ?b) => (case (not (not ?c)) ?a ?b)
+#   NOT NOT c is in {0,1,NULL} and true exactly when c is true. The branches are unchanged.
+case-and-nest-reproposal ; (case (and ?c ?d) ?a ?b) => (case ?c (case ?d ?a ?b) ?b)
+#   This failed in round 3 ONLY through an explicit COLLATE in the condition, which the guard now excludes. The value proof is unchanged, and no implicit collation is involved (CASE has none).
+case-same-cond-then-reproposal ; (case ?c (case ?c ?a ?b) ?d) => (case ?c ?a ?d)
+#   This failed in round 3 only through an explicit COLLATE on the dropped b, which is now excluded by the guard. It requires a deterministic c.
+case-same-cond-else-reproposal ; (case ?c ?a (case ?c ?b ?d)) => (case ?c ?a ?d)
+#   Same note as case-same-cond-then-reproposal.
+
+## Guard-free operand swaps: the left operand is a value node (no affinity of its own, no implicit collation, and no explicit COLLATE under the guard)
+## The collation then comes only from the other operand (its explicit COLLATE, else its column collation, else BINARY), whatever the order.
+## Comparison affinity selection is symmetric. NOT valid when the value node is cast_* (implicit collation travels through CAST), collate_*, or likely/unlikely (pass-through).
+
+swap-eq-fn-left ; (= (fn:lower ?x) ?y) => (= ?y (fn:lower ?x))
+#   lower(x) contributes no collation and no affinity, so the comparison is decided by y alone in both orders. The same rule works for any fn:* except likely/unlikely, and for <> and is/isnot.
+swap-lt-add-left ; (< (+ ?a ?b) ?y) => (> ?y (+ ?a ?b))
+#   An arithmetic result has no affinity and no collation, so the same argument applies. The same rule works for - * / rem bitand bitor neg bitnot and every ordering operator.
+swap-eq-concat-left ; (= (concat ?a ?b) ?y) => (= ?y (concat ?a ?b))
+#   || results carry neither affinity nor implicit collation.
+swap-eq-coalesce-left ; (= (coalesce ?a ?b) ?y) => (= ?y (coalesce ?a ?b))
+#   A function result, so the same argument applies. The same rule works for nullif.
+swap-lt-case-left ; (< (case ?c ?a ?b) ?y) => (> ?y (case ?c ?a ?b))
+#   CASE has no affinity and, without an explicit COLLATE, no collation.
+swap-eq-fn-right ; (= ?y (fn:lower ?x)) => (= (fn:lower ?x) ?y)
+#   This is the reverse direction. An explicit COLLATE directly on y wins from either side (left explicit, else right explicit), so it is still the same collation.
+swap-is-fn-left ; (is (fn:upper ?x) ?y) => (is ?y (fn:upper ?x))
+#   IS selects collation and affinity exactly like =.
+
+## LIKE ignores ASCII case (default build, PRAGMA case_sensitive_like=OFF)
+
+like-drop-lower-x ; (like (fn:lower ?x) ?p) => (like ?x ?p)
+#   Default LIKE folds ASCII case on both sides, and lower only changes ASCII letters, so the match is the same. A NULL x gives NULL on both sides. A BLOB is read as the same bytes.
+#   UNSOUND if case_sensitive_like is ON. Earlier runs used that pragma, so it must be off or the rule must be guarded. The same rule works for upper.
+like-drop-upper-p ; (like ?x (fn:upper ?p)) => (like ?x ?p)
+#   upper never touches the wildcards % and _, and the matcher folds case anyway. The same caveat applies. The same rule works for lower.
+lower-drop-cast-text ; (fn:lower (cast_text ?x)) => (fn:lower ?x)
+#   lower reads its argument as text with the same rendering as CAST AS TEXT. Both results are TEXT with no affinity and no collation. The same rule works for upper/trim/ltrim/rtrim.
+
+## Truth and value identities across rounds
+
+istrue-neg ; (istrue (neg ?x)) => (istrue ?x)
+#   -x is non-zero iff x is: TEXT and BLOB are numerified the same way, -int64 MIN becomes a non-zero REAL, and NULL gives 0 on both sides. The same rule works for isfalse/not.
+coalesce-eq-is ; (coalesce (= ?x ?y) (is ?x ?y)) => (is ?x ?y)
+#   Both non-NULL: = and IS agree. Any NULL makes = NULL, so it falls through to IS. The results are integers, and the comparison keeps the same operand order. The same rule works for (coalesce (<> ?x ?y) (isnot ?x ?y)) => (isnot ?x ?y).
+is-to-coalesce-eq ; (is ?x ?y) => (coalesce (= ?x ?y) (and (isnull ?x) (isnull ?y)))
+#   This gives IS as a NULL-unsafe = with a fallback when = is NULL: both NULL gives 1, one NULL gives 0. It produces an OR-free shape that the planner treats differently from IS.
+coalesce-nullif-self ; (coalesce (nullif ?x ?x) ?y) => (coalesce ?y ?y)
+#   nullif(x,x) is always NULL: either x is NULL, or x equals itself under any built-in collation. So the result is y, as a function result on both sides.
+#   SLIGHTLY UNSURE: this relies on reflexivity (no NaN can be stored). It also requires a deterministic x.
+in2-or-merge ; (or (in2 ?x ?a ?b) (in2 ?x ?c ?c)) => (in3 ?x ?a ?b ?c)
+#   An OR of two multi-element INs on the same LHS is an IN over the union of their elements. Every list uses x's affinity and collation, and the NULL outcome combines through 3-valued OR like an IN does. The in1 inconsistency is not involved.
+in3-split-in2 ; (in3 ?x ?a ?b ?c) => (or (in2 ?x ?a ?b) (in2 ?x ?c ?c))
+#   This is the reverse of in2-or-merge. It splits a list without ever creating a single-element IN.
+coalesce-bool-self ; (coalesce (< ?x ?y) (< ?x ?y)) => (< ?x ?y)
+#   For an integer-valued p, coalesce(p,p) = p, and neither side has affinity or collation. It is mostly useful as a bridge for extraction. The same rule works for every boolean-valued node.

@@ -1,0 +1,99 @@
+# Candidate rules for collate_binary / collate_nocase / collate_rtrim (agent1, round 8). Nothing here has been run yet: every rule should go through rulegate.
+#
+# The model I used (please confirm; the round-3/4/6 failures agree with it):
+#   - COLLATE does not change the value, and affinity passes through it (sqlite3ExprAffinity skips EP_Skip nodes, TK_COLLATE included).
+#   - Explicit collation of ANY expression E = the "first explicit COLLATE found" by sqlite3ExprCollSeq. A TK_COLLATE node returns its own collation at once,
+#     which is why the outermost one wins. Any other node with EP_Collate set descends into pLeft if pLeft has EP_Collate, otherwise into pRight or the arg/CASE list in order.
+#     EP_Collate propagates up through EVERY node (ISNULL, NOT, comparisons, LIKE, CASE conditions, ...), even when the node's value is an integer.
+#   - Consequence: a rule that ADDS, REMOVES or REORDERS an explicit COLLATE anywhere in a subtree can change the collation that an enclosing CASE/coalesce/||/function
+#     reports for its OTHER operands. Example: CASE WHEN c THEN isnull(x COLLATE NOCASE) ELSE 'abc' END = 'ABC' uses NOCASE. Removing the COLLATE inside isnull turns that into BINARY.
+#     So "(isnull (collate_nocase ?x)) => (isnull ?x)" and "(like (collate_nocase ?x) ?p) => (like ?x ?p)" are NOT proposed, even though their own values are identical.
+#   - SUGGESTION for the gate: add the context (= (case ?SIDE 'abc' 'abc') 'ABC') (and the same with coalesce(?SIDE,'abc')) when ?SIDE is truth- or NULL-valued.
+#     It reports exactly which collation propagates out of the rule side, and would have caught the round-3/4 failures directly.
+#   - Every rule below keeps BOTH the value AND the first-found explicit collation identical. The latter is because the same COLLATE is found first on both sides,
+#     or because a COLLATE that is never reached (a dead right operand) is the one changed.
+#   - Rejected: removing a COLLATE from the left operand, or moving it from left to right (a right-side COLLATE only wins when the left has none, which a pattern cannot check);
+#     (= ?x (collate_A ?y)) => (= (collate_A ?x) (collate_A ?y)) (x may contain its own explicit COLLATE, which wins on the left);
+#     hoisting a COLLATE out of a comparison operand, (= (collate_A x) y) => (collate_A (= x y)), which changes the comparison itself;
+#     hoisting out of a CASE branch or out of max/min/nullif arguments (CASE searches the condition first, and max/min/nullif compare with the collation internally).
+
+## Nested COLLATE: the outermost one wins (all three idempotent and all six outer-over-inner pairs)
+
+collate-nocase-idem ; (collate_nocase (collate_nocase ?x)) => (collate_nocase ?x)
+#   Same value and affinity. sqlite3ExprCollSeq stops at the outer TK_COLLATE on both sides.
+collate-binary-idem ; (collate_binary (collate_binary ?x)) => (collate_binary ?x)
+#   Same argument as collate-nocase-idem.
+collate-rtrim-idem ; (collate_rtrim (collate_rtrim ?x)) => (collate_rtrim ?x)
+#   Same argument as collate-nocase-idem.
+collate-nocase-over-rtrim ; (collate_nocase (collate_rtrim ?x)) => (collate_nocase ?x)
+#   The outer COLLATE is found first, so the inner one is never consulted. The value and affinity are unchanged.
+collate-nocase-over-binary ; (collate_nocase (collate_binary ?x)) => (collate_nocase ?x)
+#   Same argument as collate-nocase-over-rtrim.
+collate-rtrim-over-nocase ; (collate_rtrim (collate_nocase ?x)) => (collate_rtrim ?x)
+#   Same argument as collate-nocase-over-rtrim.
+collate-rtrim-over-binary ; (collate_rtrim (collate_binary ?x)) => (collate_rtrim ?x)
+#   Same argument as collate-nocase-over-rtrim.
+collate-binary-over-nocase ; (collate_binary (collate_nocase ?x)) => (collate_binary ?x)
+#   Same argument as collate-nocase-over-rtrim.
+collate-binary-over-rtrim ; (collate_binary (collate_rtrim ?x)) => (collate_binary ?x)
+#   Same argument as collate-nocase-over-rtrim.
+
+## Comparisons whose LEFT operand carries an explicit COLLATE at top level: anything collation-related on the right is dead
+
+cmp-right-collate-dead ; (= (collate_nocase ?x) (collate_rtrim ?y)) => (= (collate_nocase ?x) ?y)
+#   The left explicit COLLATE wins, so the right one is never used. Affinity is unaffected by COLLATE. Upward propagation descends into pLeft first, so it finds NOCASE on both sides.
+#   The same rule works for every (outer A, inner B) pair, for <> < <= > >=, and for is/isnot.
+cmp-right-collate-add ; (= (collate_nocase ?x) ?y) => (= (collate_nocase ?x) (collate_nocase ?y))
+#   This adds the same collation on the right. The left still wins with NOCASE, and y's value and affinity are unchanged.
+#   This likely changes index usability for y's column. The same rule works for the binary/rtrim variants and for every comparison operator.
+lt-right-collate-add ; (< (collate_rtrim ?x) ?y) => (< (collate_rtrim ?x) (collate_rtrim ?y))
+#   The same argument for an ordering comparison: the operator compares under RTRIM in both forms.
+is-right-collate-add ; (is (collate_nocase ?x) ?y) => (is (collate_nocase ?x) (collate_nocase ?y))
+#   IS uses the same collation selection as =, so the argument is the same.
+eq-swap-same-collate ; (= (collate_nocase ?x) (collate_nocase ?y)) => (= (collate_nocase ?y) (collate_nocase ?x))
+#   Whichever side comes first, the collation is NOCASE. Comparison affinity selection is symmetric (numeric if either side is numeric, TEXT if one is TEXT and the other has none).
+#   Upward propagation finds NOCASE first on both sides. So this swap is sound WITHOUT the collation guard. The same rule works for <> and is/isnot, and for binary/rtrim.
+lt-swap-same-collate ; (< (collate_nocase ?x) (collate_nocase ?y)) => (> (collate_nocase ?y) (collate_nocase ?x))
+#   Same argument for ordering. The same rule works for <= >= >.
+between-collate-add ; (between (collate_nocase ?x) ?lo ?hi) => (between (collate_nocase ?x) (collate_nocase ?lo) (collate_nocase ?hi))
+#   BETWEEN behaves like x>=lo AND x<=hi, each pair using x's explicit collation, which wins. The bounds' values and affinity are unchanged, and upward propagation finds x's COLLATE first.
+between-collate-dead ; (between (collate_nocase ?x) (collate_rtrim ?lo) (collate_binary ?hi)) => (between (collate_nocase ?x) ?lo ?hi)
+#   The bounds' COLLATEs are never consulted, because the left operand wins in both comparisons. The same rule works for any combination, including just one of the bounds collated.
+#   SLIGHTLY UNSURE: this assumes BETWEEN codegen uses the left-wins rule for both halves (it is coded as two comparisons with x on the left).
+
+## IN with a collated LEFT operand: the element collations are dead (the IN-collate inconsistency needs an UNcollated LHS, so it does not arise here)
+
+in2-elem-collate-dead ; (in2 (collate_nocase ?x) (collate_rtrim ?a) ?b) => (in2 (collate_nocase ?x) ?a ?b)
+#   A multi-element IN uses the LHS collation, which is NOCASE on both sides. Upward propagation descends into pLeft first, so it finds NOCASE.
+in2-elem-collate-add ; (in2 (collate_nocase ?x) ?a ?b) => (in2 (collate_nocase ?x) (collate_nocase ?a) (collate_nocase ?b))
+#   Same argument. Element values and affinity are unchanged, and x's affinity is still the one applied. The same rule works for in3.
+in1-elem-collate-add ; (in1 (collate_nocase ?x) ?a) => (in1 (collate_nocase ?x) (collate_nocase ?a))
+#   If a is constant, SQLite rewrites this to x COLLATE NOCASE = +(a COLLATE NOCASE), where the left wins. Otherwise it is an IN compared with the LHS collation. NOCASE applies either way.
+#   SLIGHTLY UNSURE: this depends on how the in1 rewrite treats the element's COLLATE. It should be harmless because the left wins.
+
+## Hoisting a COLLATE from the FIRST-searched operand of a collation-insensitive operator to above it
+## (the value is unchanged, the affinity is unchanged because COLLATE is transparent, and the first-found explicit collation is the same A on both sides)
+
+isnull-collate-hoist ; (isnull (collate_nocase ?x)) => (collate_nocase (isnull ?x))
+#   ISNULL ignores collation. The left side finds NOCASE by descending, and the right side finds it at the top. The same rule works for isnotnull/istrue/isfalse/isnottrue/isnotfalse/not.
+not-collate-hoist ; (not (collate_rtrim ?x)) => (collate_rtrim (not ?x))
+#   Same argument as isnull-collate-hoist.
+neg-collate-hoist ; (neg (collate_nocase ?x)) => (collate_nocase (neg ?x))
+#   Unary minus ignores collation. The same rule works for bitnot.
+cast-collate-hoist ; (cast_int (collate_nocase ?x)) => (collate_nocase (cast_int ?x))
+#   CAST ignores collation. The INTEGER affinity of the CAST passes through the outer COLLATE. The same rule works for every cast_*.
+#   SLIGHTLY UNSURE: this assumes the implicit-collation path through CAST does not interfere. With an explicit COLLATE present, the explicit one is always found first.
+concat-left-collate-hoist ; (concat (collate_nocase ?x) ?y) => (collate_nocase (concat ?x ?y))
+#   || ignores collation. The left operand is searched first, so NOCASE is found before any COLLATE in y on both sides. This is NOT valid for the right operand.
+add-left-collate-hoist ; (+ (collate_nocase ?x) ?y) => (collate_nocase (+ ?x ?y))
+#   Same argument as concat-left-collate-hoist. The same rule works for - * / rem bitand bitor (left operand only).
+lower-collate-hoist ; (fn:lower (collate_nocase ?x)) => (collate_nocase (fn:lower ?x))
+#   lower ignores collation, and its single argument is the first one searched. The same rule works for upper/trim/ltrim/rtrim/length/hex/quote/typeof/abs/round/likely.
+#   NOT valid for max/min/nullif/instr-like functions that compare internally.
+coalesce-first-collate-hoist ; (coalesce (collate_nocase ?a) ?b) => (collate_nocase (coalesce ?a ?b))
+#   coalesce compares nothing, and its first argument is searched first. The value is the same, and neither form has affinity.
+case-cond-collate-hoist ; (case (collate_nocase ?c) ?a ?b) => (collate_nocase (case ?c ?a ?b))
+#   The truth of c is unaffected by COLLATE. CASE searches the condition first, so NOCASE is found before any COLLATE in a or b on both sides.
+like-pattern-collate-hoist ; (like ?x (collate_nocase ?p)) => (collate_nocase (like ?x ?p))
+#   LIKE ignores collation. UNSURE: this relies on my recollection that x LIKE p is built as like(p, x), with the PATTERN as the first argument, so the pattern is searched first.
+#   If the order is (x, p) instead, this rule is unsound and the x-side version is the sound one. The same rule works for glob.

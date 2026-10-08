@@ -1921,6 +1921,51 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("isnull-via-is-reflexive"; "(isnull ?x)" => "(is (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnotnull-via-isnot-reflexive"; "(isnotnull ?x)" => "(isnot (= ?x ?x) (not (= ?x ?x)))"),
         rewrite!("isnot-sym"; "(isnot ?x ?y)" => "(isnot ?y ?x)"),
+        //  Restored: the ten CASE/coalesce rules removed earlier today fail only where an explicit
+        //  COLLATE sits inside a CASE or coalesce, which explicit_collation_under_a_value now keeps
+        //  away from every rule. They pass rulegate.py with that guard modelled.
+        rewrite!("case-isnull-swap"; "(case (isnull ?x) ?a ?b)" => "(case (isnotnull ?x) ?b ?a)"),
+        rewrite!("case-is-swap"; "(case (is ?x ?y) ?a ?b)" => "(case (isnot ?x ?y) ?b ?a)"),
+        rewrite!("case-istrue-swap"; "(case (istrue ?c) ?a ?b)" => "(case (isnottrue ?c) ?b ?a)"),
+        rewrite!("case-isfalse-swap"; "(case (isfalse ?c) ?a ?b)" => "(case (isnotfalse ?c) ?b ?a)"),
+        rewrite!("case-or-nest"; "(case (or ?c ?d) ?a ?b)" => "(case ?c ?a (case ?d ?a ?b))"),
+        rewrite!("case-cond-case"; "(case (case ?c ?d ?e) ?a ?b)" => "(case ?c (case ?d ?a ?b) (case ?e ?a ?b))"),
+        rewrite!("add-into-case"; "(+ (case ?c ?a ?b) ?d)" => "(case ?c (+ ?a ?d) (+ ?b ?d))"),
+        rewrite!("concat-into-case"; "(concat (case ?c ?a ?b) ?d)" => "(case ?c (concat ?a ?d) (concat ?b ?d))"),
+        rewrite!("concat-into-coalesce"; "(concat (coalesce ?a ?b) ?c)" => "(coalesce (concat ?a ?c) (concat ?b ?c))"),
+        rewrite!("coalesce-into-case"; "(coalesce (case ?c ?a ?b) ?d)" => "(case ?c (coalesce ?a ?d) (coalesce ?b ?d))"),
+        //  COLLATE (agent round 8). eq-swap-same-collate and lt-swap-same-collate repeat the
+        //  guarded swaps for two sides with the same explicit collation, where the guard withholds them.
+        rewrite!("collate-nocase-idem"; "(collate_nocase (collate_nocase ?x))" => "(collate_nocase ?x)"),
+        rewrite!("collate-binary-idem"; "(collate_binary (collate_binary ?x))" => "(collate_binary ?x)"),
+        rewrite!("collate-rtrim-idem"; "(collate_rtrim (collate_rtrim ?x))" => "(collate_rtrim ?x)"),
+        rewrite!("collate-nocase-over-rtrim"; "(collate_nocase (collate_rtrim ?x))" => "(collate_nocase ?x)"),
+        rewrite!("collate-nocase-over-binary"; "(collate_nocase (collate_binary ?x))" => "(collate_nocase ?x)"),
+        rewrite!("collate-rtrim-over-nocase"; "(collate_rtrim (collate_nocase ?x))" => "(collate_rtrim ?x)"),
+        rewrite!("collate-rtrim-over-binary"; "(collate_rtrim (collate_binary ?x))" => "(collate_rtrim ?x)"),
+        rewrite!("collate-binary-over-nocase"; "(collate_binary (collate_nocase ?x))" => "(collate_binary ?x)"),
+        rewrite!("collate-binary-over-rtrim"; "(collate_binary (collate_rtrim ?x))" => "(collate_binary ?x)"),
+        rewrite!("cmp-right-collate-dead"; "(= (collate_nocase ?x) (collate_rtrim ?y))" => "(= (collate_nocase ?x) ?y)"),
+        rewrite!("cmp-right-collate-add"; "(= (collate_nocase ?x) ?y)" => "(= (collate_nocase ?x) (collate_nocase ?y))"),
+        rewrite!("lt-right-collate-add"; "(< (collate_rtrim ?x) ?y)" => "(< (collate_rtrim ?x) (collate_rtrim ?y))"),
+        rewrite!("is-right-collate-add"; "(is (collate_nocase ?x) ?y)" => "(is (collate_nocase ?x) (collate_nocase ?y))"),
+        rewrite!("eq-swap-same-collate"; "(= (collate_nocase ?x) (collate_nocase ?y))" => "(= (collate_nocase ?y) (collate_nocase ?x))"),
+        rewrite!("lt-swap-same-collate"; "(< (collate_nocase ?x) (collate_nocase ?y))" => "(> (collate_nocase ?y) (collate_nocase ?x))"),
+        rewrite!("between-collate-add"; "(between (collate_nocase ?x) ?lo ?hi)" => "(between (collate_nocase ?x) (collate_nocase ?lo) (collate_nocase ?hi))"),
+        rewrite!("between-collate-dead"; "(between (collate_nocase ?x) (collate_rtrim ?lo) (collate_binary ?hi))" => "(between (collate_nocase ?x) ?lo ?hi)"),
+        rewrite!("in2-elem-collate-dead"; "(in2 (collate_nocase ?x) (collate_rtrim ?a) ?b)" => "(in2 (collate_nocase ?x) ?a ?b)"),
+        rewrite!("in2-elem-collate-add"; "(in2 (collate_nocase ?x) ?a ?b)" => "(in2 (collate_nocase ?x) (collate_nocase ?a) (collate_nocase ?b))"),
+        rewrite!("in1-elem-collate-add"; "(in1 (collate_nocase ?x) ?a)" => "(in1 (collate_nocase ?x) (collate_nocase ?a))"),
+        rewrite!("isnull-collate-hoist"; "(isnull (collate_nocase ?x))" => "(collate_nocase (isnull ?x))"),
+        rewrite!("not-collate-hoist"; "(not (collate_rtrim ?x))" => "(collate_rtrim (not ?x))"),
+        rewrite!("neg-collate-hoist"; "(neg (collate_nocase ?x))" => "(collate_nocase (neg ?x))"),
+        rewrite!("cast-collate-hoist"; "(cast_int (collate_nocase ?x))" => "(collate_nocase (cast_int ?x))"),
+        rewrite!("concat-left-collate-hoist"; "(concat (collate_nocase ?x) ?y)" => "(collate_nocase (concat ?x ?y))"),
+        rewrite!("add-left-collate-hoist"; "(+ (collate_nocase ?x) ?y)" => "(collate_nocase (+ ?x ?y))"),
+        rewrite!("lower-collate-hoist"; "(fn:lower (collate_nocase ?x))" => "(collate_nocase (fn:lower ?x))"),
+        rewrite!("coalesce-first-collate-hoist"; "(coalesce (collate_nocase ?a) ?b)" => "(collate_nocase (coalesce ?a ?b))"),
+        rewrite!("case-cond-collate-hoist"; "(case (collate_nocase ?c) ?a ?b)" => "(collate_nocase (case ?c ?a ?b))"),
+        rewrite!("like-pattern-collate-hoist"; "(like ?x (collate_nocase ?p))" => "(collate_nocase (like ?x ?p))"),
         //  Function calls (fn:*, agent round 7). Left out: isnull-substr (substr(x'', 0, 0) is
         //  NULL), abs-idem (abs of the int64 minimum is an error), likely-drop (a call has no
         //  affinity, so likely(c) = '1' and c = '1' differ for an INTEGER column).
@@ -3437,6 +3482,65 @@ const NONDETERMINISTIC_MARKERS: [&str; 9] = [
 /// NULL through a double negation and through `p AND p` / `p OR p` - but they change the shape
 /// the query planner sees, which is what decides whether an index is used.
 /// Whether a predicate may answer differently on a second evaluation.
+/// Whether an explicit COLLATE sits under an expression whose value can be compared: arithmetic,
+/// ||, bit operators, a prefix sign, CAST, CASE, or a function argument. A COLLATE directly on a
+/// comparison operand, or under the truth-valued operators between it and the WHERE, is not.
+pub fn explicit_collation_under_a_value(expr: &SqlExpr) -> bool {
+    fn walk(e: &SqlExpr, inside: bool) -> bool {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+        match e {
+            SqlExpr::Collate { expr, .. } => inside || walk(expr, inside),
+            SqlExpr::Nested(x) => walk(x, inside),
+            SqlExpr::BinaryOp { left, op, right } => {
+                let value = matches!(
+                    op,
+                    BinaryOperator::Plus
+                        | BinaryOperator::Minus
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                        | BinaryOperator::StringConcat
+                        | BinaryOperator::BitwiseAnd
+                        | BinaryOperator::BitwiseOr
+                        | BinaryOperator::PGBitwiseShiftLeft
+                        | BinaryOperator::PGBitwiseShiftRight
+                );
+                walk(left, inside || value) || walk(right, inside || value)
+            }
+            SqlExpr::UnaryOp { op, expr } => walk(expr, inside || !matches!(op, UnaryOperator::Not)),
+            SqlExpr::Cast { expr, .. } => walk(expr, true),
+            SqlExpr::Case { operand, conditions, else_result, .. } => {
+                operand.as_deref().map_or(false, |x| walk(x, true))
+                    || conditions.iter().any(|w| walk(&w.condition, true) || walk(&w.result, true))
+                    || else_result.as_deref().map_or(false, |x| walk(x, true))
+            }
+            SqlExpr::Function(f) => match &f.args {
+                FunctionArguments::List(list) => list.args.iter().any(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => walk(x, true),
+                    _ => false,
+                }),
+                _ => false,
+            },
+            SqlExpr::IsNull(x)
+            | SqlExpr::IsNotNull(x)
+            | SqlExpr::IsTrue(x)
+            | SqlExpr::IsFalse(x)
+            | SqlExpr::IsNotTrue(x)
+            | SqlExpr::IsNotFalse(x) => walk(x, inside),
+            SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => walk(l, inside) || walk(r, inside),
+            SqlExpr::Between { expr, low, high, .. } => {
+                walk(expr, inside) || walk(low, inside) || walk(high, inside)
+            }
+            SqlExpr::InList { expr, list, .. } => walk(expr, inside) || list.iter().any(|x| walk(x, inside)),
+            SqlExpr::Like { expr, pattern, .. } | SqlExpr::SimilarTo { expr, pattern, .. } => {
+                walk(expr, inside) || walk(pattern, inside)
+            }
+            _ => false,
+        }
+    }
+    walk(expr, false)
+}
+
 pub fn is_nondeterministic(expr: &SqlExpr) -> bool {
     let rendered = expr.to_string().to_lowercase();
     NONDETERMINISTIC_MARKERS
@@ -3856,6 +3960,16 @@ fn generate_equivalent_where_clauses_impl(
     // through every other path. identity_variants already knows to offer only the single-evaluation
     // identity for such a predicate.
     if is_nondeterministic(where_expr) {
+        return Ok(identity_variants(where_expr, source_sql, max_variants));
+    }
+
+    // An explicit COLLATE under a value-producing expression gives that value its collation even
+    // through operators whose own result is an integer - CASE WHEN ((x COLLATE NOCASE) IS NULL) THEN
+    // 'abc' ELSE 'abc' END = 'ABC' is 1, without the COLLATE 0 - and SQLite takes the first explicit
+    // COLLATE it meets. and-comm, De Morgan, distribution and 34 other rules reorder sub-expressions
+    // and so change which one that is (rulegate.py, 2026-10-08). Such a predicate gets only the
+    // identities, which reorder nothing.
+    if explicit_collation_under_a_value(where_expr) {
         return Ok(identity_variants(where_expr, source_sql, max_variants));
     }
 
@@ -4347,16 +4461,23 @@ mod tests {
 
     #[test]
     fn the_reported_collation_mismatch_gets_no_swapped_variant() {
+        // Checked by result, not spelling: COLLATE rules may legitimately rewrite the operands (a
+        // dead right-hand COLLATE dropped, the same collation on both sides then swapped).
         let sql = r#"SELECT * FROM "t0" WHERE ("c0" COLLATE nocase)='abc' COLLATE binary"#;
         let variants =
             generate_equivalent_where_clauses(&parse_predicate(sql), sql, 16, 20).expect("generates");
         assert!(!variants.is_empty(), "the rules that keep the order still apply");
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE t0(c0 TEXT); INSERT INTO t0 VALUES ('ABC'), ('abc'), ('x'), (NULL);")
+            .unwrap();
+        let rows = |predicate: &str| -> Vec<String> {
+            let mut stmt = db.prepare(&format!("SELECT c0 FROM t0 WHERE {} ORDER BY rowid", predicate)).unwrap();
+            stmt.query_map([], |r| r.get::<_, Option<String>>(0)).unwrap().map(|v| format!("{:?}", v.unwrap())).collect()
+        };
+        let expected = rows(r#"("c0" COLLATE nocase)='abc' COLLATE binary"#);
+        assert_eq!(expected.len(), 2, "NOCASE matches both spellings");
         for v in &variants {
-            // Case-insensitive: the collate nodes print the collation name in capitals.
-            let s = v.to_string().to_lowercase();
-            let binary_side = s.find("'abc' collate binary").expect("keeps the literal side");
-            let nocase_side = s.find("\"c0\" collate nocase").expect("keeps the column side");
-            assert!(nocase_side < binary_side, "the NOCASE side moved right: {s}");
+            assert_eq!(rows(&v.to_string()), expected, "variant answers differently: {}", v);
         }
     }
 

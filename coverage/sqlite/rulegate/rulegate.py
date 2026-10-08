@@ -129,6 +129,22 @@ def to_sql(tree, binding):
     raise ValueError("unknown operator " + op)
 
 
+def variables_under_values(tree, under=False, out=None):
+    """Variables of a pattern that sit below a value-producing node (arithmetic, ||, CASE, a call,
+    CAST, COLLATE's operand is not counted): where the server sees an explicit COLLATE there, it
+    rewrites nothing (explicit_collation_under_a_value), so such bindings never meet the rule."""
+    out = set() if out is None else out
+    if isinstance(tree, str):
+        if tree.startswith("?") and under:
+            out.add(tree)
+        return out
+    op = tree[0]
+    value = op in VALUE_OPS and not op.startswith("collate_") or op.startswith("fn:")
+    for child in tree[1:]:
+        variables_under_values(child, under or value, out)
+    return out
+
+
 def produces_value(tree):
     # A bare variable can be a column, which brings its affinity and collation to the comparison.
     return isinstance(tree, str) or tree[0] in VALUE_OPS or tree[0].startswith("fn:")
@@ -169,9 +185,16 @@ def check_rule_unguarded(rule):
     for v in variables(rhs):
         if v not in vs:
             return {"name": name, "status": "ERROR", "detail": "rhs variable %s not bound by lhs" % v}
-    contexts = ["{e}"]
+    # Every rule, truth-valued ones too: an explicit COLLATE anywhere inside a CASE condition or
+    # branch gives the CASE result its collation, even through isnull, NOT, = or LIKE, whose own value
+    # is an integer (measured 2026-10-08: CASE WHEN (('x' COLLATE NOCASE) IS NULL) THEN 'abc' ELSE
+    # 'abc' END = 'ABC' is 1, without the COLLATE 0). A rule that drops, adds or reorders such a
+    # COLLATE changes the comparison around an enclosing CASE.
+    contexts = ["{e}", "((CASE WHEN {e} THEN 'abc' ELSE 'abc' END) = 'ABC')",
+                "((CASE WHEN 0 THEN {e} ELSE 'abc' END) = 'ABC')"]
     if produces_value(lhs) or produces_value(rhs):
         contexts += [t.format(e="{e}", w=w) for t in COMPARISON_TEMPLATES for w in COMPARISON_PARTNERS]
+    guarded_vars = variables_under_values(lhs)
     db = sqlite3.connect(":memory:")
     db.execute(SCHEMA)
     for lit in LITERALS:
@@ -206,9 +229,18 @@ def check_rule_unguarded(rule):
         l_sql, r_sql = to_sql(lhs, binding), to_sql(rhs, binding)
         # All contexts of a binding in one statement; only a binding that fails somewhere is run
         # again context by context to say where.
-        groups = [[c for c in contexts if "w." not in c]]
+        # The server rewrites nothing where an explicit COLLATE sits under a value-producing
+        # expression (explicit_collation_under_a_value): a binding that puts one below a value node of
+        # the lhs never meets the rule, and the enclosing-CASE contexts only meet bindings without one.
+        is_explicit = lambda c: c == ("col", EXPLICIT) or (c[0] == "lit" and c[1] in COLLATED_LITERALS)
+        if any(is_explicit(c) and v in guarded_vars for v, c in zip(vs, choice)):
+            continue
+        explicit_binding = any(is_explicit(c) for c in choice)
+        usable = [c for c in contexts if not (explicit_binding and "CASE WHEN" in c and "{e}" in c
+                                                and c.startswith("((CASE"))]
+        groups = [[c for c in usable if "w." not in c]]
         if len(frm) < 2:
-            groups.append([c for c in contexts if "w." in c])
+            groups.append([c for c in usable if "w." in c])
         for group in groups:
             if not group:
                 continue
