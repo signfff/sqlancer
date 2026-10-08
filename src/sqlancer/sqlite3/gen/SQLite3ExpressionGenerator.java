@@ -700,9 +700,10 @@ public class SQLite3ExpressionGenerator implements ExpressionGenerator<SQLite3Ex
 
     private SQLite3Expression getBinaryComparisonOperator(int depth) {
         SQLite3Expression leftExpression = getRandomExpression(depth + 1);
-        BinaryComparisonOperator operator = egraphMode
-                ? BinaryComparisonOperator.getRandomRowValueOperator()   // no IS/IS_NOT
-                : BinaryComparisonOperator.getRandomOperator();
+        // Every comparison operator, IS, IS NOT, LIKE and GLOB included: the rewrite server parses
+        // and rewrites them all now (is/isnot/like/glob nodes, 2026-10-08). Leaving them out made
+        // them absent from the live workload - 0 of 7056 requests reached an is or glob node.
+        BinaryComparisonOperator operator = BinaryComparisonOperator.getRandomOperator();
         SQLite3Expression rightExpression = getRandomExpression(depth + 1);
         return new SQLite3Expression.BinaryComparisonOperation(leftExpression, rightExpression, operator);
     }

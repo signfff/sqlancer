@@ -103,7 +103,7 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
                     .readQueryInputRecords(globalState.getDbmsSpecificOptions());
 
             EGraphMetamorphicOracle.QueryGenerator<SQLite3GlobalState> queryGenerator = (state) -> {
-                if (!corpusInputs.isEmpty() && Randomly.fromOptions(true, true, false)) {
+                if (!corpusInputs.isEmpty() && Randomly.getNotCachedInteger(0, 100) < CORPUS_PERCENT) {
                     try {
                         return createCorpusGeneratedQuery(state, corpusInputs);
                     } catch (IgnoreMeException ignored) {
@@ -1194,6 +1194,14 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
     // judgment starts producing data without materially moving throughput.
     private static final int EMPTY_BASE_CHECK_PERCENT = Integer
             .getInteger("egraph.emptyBaseCheckPercent", 10);
+
+    /**
+     * Share of checks that take their base query from the corpora rather than the generator. It was
+     * two thirds; measured 2026-10-08, the corpora - chosen for coverage - made 72% of the live
+     * workload and carried almost none of the constructs the rewrite language has grown (IS, LIKE,
+     * IN lists, casts, function calls), so 111 of 305 rules never fired. Half by default.
+     */
+    private static final int CORPUS_PERCENT = Integer.getInteger("sqlite3.egraph.corpusPercent", 50);
 
     private static final boolean AUTO_RESEARCH_GUIDED_SHAPES = Boolean
             .parseBoolean(System.getProperty("sqlite3.egraph.autoResearchGuidedShapes", "true"));

@@ -30,22 +30,24 @@ public class TestEGraphPredicateFilter {
     }
 
     @Test
-    public void testRejectsUnsupportedBinaryOperatorInSubtree() {
+    public void testAcceptsConcatenationInSubtree() {
+        // The rewrite server has a concat node now; || used to be rejected here.
         SQLite3Expression concat = new Sqlite3BinaryOperation(column(), SQLite3Constant.createTextConstant("x"),
                 BinaryOperator.CONCATENATE);
         SQLite3Expression expr = new BinaryComparisonOperation(concat, SQLite3Constant.createTextConstant("1"),
                 BinaryComparisonOperator.EQUALS);
 
-        assertFalse(EGraphPredicateFilter.isEgraphCompatible(expr));
+        assertTrue(EGraphPredicateFilter.isEgraphCompatible(expr));
     }
 
     @Test
-    public void testRejectsBitwiseNegationInSubtree() {
+    public void testAcceptsBitwiseNegationInSubtree() {
+        // The rewrite server has a bitnot node now; ~ used to be rejected here.
         SQLite3Expression bitwiseNegation = new SQLite3UnaryOperation(UnaryOperator.NEGATE, column());
         SQLite3Expression expr = new BinaryComparisonOperation(bitwiseNegation, SQLite3Constant.createIntConstant(1),
                 BinaryComparisonOperator.EQUALS);
 
-        assertFalse(EGraphPredicateFilter.isEgraphCompatible(expr));
+        assertTrue(EGraphPredicateFilter.isEgraphCompatible(expr));
     }
 
     @Test

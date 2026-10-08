@@ -30,8 +30,8 @@ import sqlancer.sqlite3.schema.SQLite3Schema.SQLite3Column;
  * <li>{@link #isPotentiallySatisfiable} - four-valued reasoning that rejects clauses that can never be TRUE
  * ({@code (c0)-(c0)}, {@code (c0)<(c0)}, any comparison against NULL). An empty original result makes the metamorphic
  * comparison vacuous, so those are discarded before the probe query runs.</li>
- * <li>{@link #isEgraphCompatible} - rejects clauses the rewrite server cannot represent (unsupported binary
- * operators, bitwise negation) or that reference no column at all.</li>
+ * <li>{@link #isEgraphCompatible} - rejects clauses that reference no column at all or nest deeper than
+ * MAX_EXPR_DEPTH.</li>
  * </ul>
  */
 public class EGraphPredicateFilter {
@@ -461,18 +461,9 @@ public class EGraphPredicateFilter {
         if (expr instanceof SQLite3Constant || expr instanceof SQLite3ColumnName) {
             return false;
         }
-        // Reject bitwise/concat at root; egraph cannot rewrite them
-        if (expr instanceof Sqlite3BinaryOperation) {
-            Sqlite3BinaryOperation bin = (Sqlite3BinaryOperation) expr;
-            Sqlite3BinaryOperation.BinaryOperator op = bin.getOperator();
-            if (op == Sqlite3BinaryOperation.BinaryOperator.ARITHMETIC_AND
-                    || op == Sqlite3BinaryOperation.BinaryOperator.ARITHMETIC_OR
-                    || op == Sqlite3BinaryOperation.BinaryOperator.CONCATENATE
-                    || op == Sqlite3BinaryOperation.BinaryOperator.SHIFT_LEFT
-                    || op == Sqlite3BinaryOperation.BinaryOperator.SHIFT_RIGHT) {
-                return false;
-            }
-        }
+        // Bitwise operators, ||, shifts and unary minus used to be rejected here as something the
+        // e-graph could not rewrite. It has nodes for &, |, ||, ~ and unary minus (and keeps a shift
+        // as one opaque atom), so rejecting them only kept those operators out of the workload.
         // Full tree scan: column reference + depth
         EgraphCompatChecker c = new EgraphCompatChecker();
         c.walk(expr, 0);
@@ -495,20 +486,12 @@ public class EGraphPredicateFilter {
                 walk(c.getLeft(), depth + 1); walk(c.getRight(), depth + 1);
             } else if (e instanceof Sqlite3BinaryOperation) {
                 Sqlite3BinaryOperation b = (Sqlite3BinaryOperation) e;
-                if (isUnsupportedBinaryOperator(b.getOperator())) {
-                    unsupported = true;
-                    return;
-                }
                 walk(b.getLeft(), depth + 1); walk(b.getRight(), depth + 1);
             } else if (e instanceof BetweenOperation) {
                 BetweenOperation b = (BetweenOperation) e;
                 walk(b.getExpression(), depth + 1);
                 walk(b.getLeft(), depth + 1); walk(b.getRight(), depth + 1);
             } else if (e instanceof SQLite3UnaryOperation) {
-                if (((SQLite3UnaryOperation) e).getOperation() == SQLite3UnaryOperation.UnaryOperator.NEGATE) {
-                    unsupported = true;
-                    return;
-                }
                 walk(((SQLite3UnaryOperation) e).getExpression(), depth + 1);
             } else if (e instanceof SQLite3PostfixUnaryOperation) {
                 walk(((SQLite3PostfixUnaryOperation) e).getExpression(), depth + 1);
@@ -548,12 +531,5 @@ public class EGraphPredicateFilter {
             // contributes no column and no depth.
         }
 
-        private static boolean isUnsupportedBinaryOperator(Sqlite3BinaryOperation.BinaryOperator op) {
-            return op == Sqlite3BinaryOperation.BinaryOperator.ARITHMETIC_AND
-                    || op == Sqlite3BinaryOperation.BinaryOperator.ARITHMETIC_OR
-                    || op == Sqlite3BinaryOperation.BinaryOperator.CONCATENATE
-                    || op == Sqlite3BinaryOperation.BinaryOperator.SHIFT_LEFT
-                    || op == Sqlite3BinaryOperation.BinaryOperator.SHIFT_RIGHT;
-        }
     }
 }
