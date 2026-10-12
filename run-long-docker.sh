@@ -8,7 +8,8 @@
 #   * The image entrypoint passes every argument to SQLancer, so the JVM flags travel in
 #     JAVA_TOOL_OPTIONS; -w points SQLancer's working directory at the run directory so
 #     logs/, databases/ and the superjournals land there.
-#   * The run is capped at 86400 seconds; relaunch for more.
+#   * No --timeout-seconds: the run ends when the 100000 tries / 100000 queries finish, or it is
+#     stopped by hand - an upper bound would cut a run that is still making progress.
 set -eu
 
 cd /bdata/lxy/zwq/SQL || exit 1
@@ -34,7 +35,6 @@ exec docker run --rm \
   --max-generated-databases=-1 \
   --num-queries=100000 \
   --num-statement-kind-retries=3 \
-  --timeout-seconds=86400 \
   --print-progress-information=true \
   --print-progress-summary=true \
   --log-each-select=true \
