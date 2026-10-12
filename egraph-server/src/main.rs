@@ -139,6 +139,18 @@ fn preprocess_unquoted_sql(input: &str) -> String {
     // SQLite allows an empty list, `x IN ()`, and sqlparser does not: it was the commonest refusal
     // of the 2026-10-07 long run (2265 logged). An empty subquery is the same set - x IN () is 0
     // and x NOT IN () is 1 for every x, NULL included, measured both ways.
+    // Chained COLLATE, `x COLLATE a COLLATE b`, is a chain of suffix operators in SQLite and the
+    // rightmost name decides; sqlparser parses only one. Fold the chain to the rightmost.
+    static RE_COLLATE_CHAIN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)\bCOLLATE\s+\w+(?:\s+COLLATE\s+\w+)+"#).unwrap());
+    let s = RE_COLLATE_CHAIN
+        .replace_all(&s, |c: &regex::Captures| {
+            static RE_LAST: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r#"(?i)\bCOLLATE\s+(\w+)\s*$"#).unwrap());
+            let name = RE_LAST.captures(&c[0]).unwrap()[1].to_string();
+            format!("COLLATE {}", name)
+        })
+        .to_string();
     // GLOB is SQLite's; sqlparser has no such operator and refused every query with one. It does
     // have SIMILAR TO, which SQLite has not and which sits at the same precedence as LIKE, so GLOB
     // travels under that name and restore_glob gives it back on the way out.
@@ -410,6 +422,21 @@ mod tests {
         // The spaced spellings keep working through RE_IS.
         let _ = parse_one("SELECT c0 FROM t0 WHERE c0 IS (c1)");
         let _ = parse_one("SELECT c0 FROM t0 WHERE c0 IS NOT (c1)");
+    }
+
+    #[test]
+    fn folds_chained_collate_to_the_rightmost() {
+        // SQLite chains COLLATE as suffix operators and the rightmost name decides; sqlparser
+        // accepts only one, so the chain is folded in preprocessing.
+        let sql = "SELECT * FROM rt1 WHERE 'x' COLLATE BINARY COLLATE NOCASE";
+        let p = preprocess_sqlite_sql(sql);
+        assert!(!p.contains("COLLATE BINARY COLLATE"), "{p}");
+        assert!(p.contains("COLLATE NOCASE"), "{p}");
+        let _ = parse_one(sql);
+        // Three deep, mixed case, and on a column operand.
+        let sql = "SELECT * FROM t0 WHERE ((c0)COLLATE rtrim COLLATE BINARY)";
+        assert!(!preprocess_sqlite_sql(sql).contains("COLLATE rtrim COLLATE"), "{sql}");
+        let _ = parse_one(sql);
     }
 
     #[test]
