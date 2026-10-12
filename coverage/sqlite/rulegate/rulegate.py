@@ -31,7 +31,13 @@ import sys
 from multiprocessing import Pool
 
 LITERALS = ["NULL", "0", "1", "-1", "2", "9223372036854775807", "-9223372036854775808", "0.5", "1.0",
-            "-0.0", "1e308", "'abc'", "'ABC'", "''", "'1'", "' 1'", "'1.0'", "'a '", "x''", "x'31'"]
+            "-0.0", "1e308", "'abc'", "'ABC'", "''", "'1'", "' 1'", "'1.0'", "'a '", "x''", "x'31'",
+            # REAL boundaries: '1e999' overflows to +Inf in a REAL/NUMERIC column and in CAST(... AS
+            # REAL), and lower(+Inf) is the text 'inf', whose truth value is 0 while +Inf's is 1 -
+            # istrue-lower failed on exactly this (trunk-optmask11). 'inf'/'nan' as text cast to 0.0,
+            # '0x10' casts to 0.0 while its numeric prefix is 0, and '12.5abc' casts by prefix.
+            "'1e999'", "'-1e999'", "'inf'", "'nan'", "'0x10'", "' 0x10'", "'99999999999999999999'",
+            "'2.5e-999'", "'12.5abc'", "x'3130'"]
 COLUMNS = ["c_int", "c_real", "c_text", "c_blob", "c_num", "c_any", "c_nocase", "c_rtrim"]
 EXPLICIT = "COLL"  # (vN.c_text COLLATE NOCASE)
 SCHEMA = ("CREATE TABLE v(c_int INTEGER, c_real REAL, c_text TEXT, c_blob BLOB, c_num NUMERIC, c_any, "

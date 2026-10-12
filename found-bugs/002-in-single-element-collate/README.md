@@ -1,6 +1,6 @@
 # 002 单元素 IN 列表采用了右侧常量的显式 COLLATE
 
-- **状态**：已确认、已查重（无人报过），**2026-10-08 已发帖**（用户本人发出）。新帖需版主审核，审核通过前公开列表里看不到；帖子链接和官方回复待补
+- **状态**：**官方已确认并修复**。帖子：https://sqlite.org/bugs/forumpost/c91d35bed9 。drh 回复 "check-in 53a73aa03d05350e. Test cases are in TH3."（2026-10-08 19:06 UTC，发帖后约 6.5 小时）。回归测试已进 TH3
 - **组件**：解析器对单元素 IN 的改写（`src/parse.y`）+ 排序规则选择（`sqlite3ExprCollSeq`，`src/expr.c`）
 - **类别**：查询结果错误（逻辑 bug），违背文档语义，且内部不一致
 
@@ -79,8 +79,14 @@ if( Y->nExpr==1 && sqlite3ExprIsConstant(pParse,pRHS) && A->op!=TK_VECTOR ){
 | 时间 | 事件 |
 |---|---|
 | 2026-10-08 | 第 6 轮，agent 提出风险；rulegate 加入新来源后 6 条规则失败；人工确认并定位根因，完成查重和报告草稿 |
-| 2026-10-08 | 用户发帖，进入版主审核（同日 12:38 UTC 查看公开列表时尚未出现） |
-| 待补 | 审核通过 / 官方回复 / 修复提交 |
+| 2026-10-08 12:36 UTC | 用户发帖（帖号 c91d35bed9），通过版主审核并公开 |
+| 2026-10-08 19:06 UTC | **drh 提交修复** 53a73aa03d05350e（改动 `src/parse.y`），并在帖内回复 "Test cases are in TH3." |
+
+## 官方修复（check-in 53a73aa03d05350e，drh，2026-10-08 19:06 UTC）
+
+- 提交说明原文：*Disable the "expr IN (const)" to "expr=const" optimization when "const" has a COLLATE clause, as using the collating on "=" would give the wrong answer.*
+- 即：**当常量带显式 COLLATE 时，禁用 `x IN (常量)` → `x = +常量` 的改写优化**。与报告中的根因定位完全一致（parse.y 的改写 + sqlite3ExprCollSeq 看穿 TK_UPLUS）。
+- 回归测试进入 TH3（SQLite 内部测试套件），意味着该案例被长期保留为正式回归测试。
 
 ## 文件
 

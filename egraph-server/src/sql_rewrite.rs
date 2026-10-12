@@ -2039,8 +2039,13 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("max-of-bools-to-or"; "(fn:max (istrue ?a) (istrue ?b))" => "(or (istrue ?a) (istrue ?b))"),
         rewrite!("min-of-bools-to-and"; "(fn:min (istrue ?a) (istrue ?b))" => "(and (istrue ?a) (istrue ?b))"),
         rewrite!("max-self-to-min-self"; "(fn:max ?x ?x)" => "(fn:min ?x ?x)"),
-        rewrite!("istrue-lower"; "(istrue (fn:lower ?x))" => "(istrue ?x)"),
-        //  IN lists and LIKE / GLOB (agent round 6). Left out: like-self (NULL LIKE NULL is NULL),
+        // Removed istrue-lower (2026-10-12): (istrue (fn:lower ?x)) => (istrue ?x) reads
+        // differently when x is REAL +-Inf - lower(Inf) is the text 'inf', whose truth value is 0,
+        // while Inf's is 1; the trunk-optmask11 long run caught it live (CASE WHEN lower(c0) missed
+        // the -Inf row). NaN would break it the same way but cannot be stored. The isnull-*
+        // siblings are safe: SQLite turns every NaN an expression could make into NULL, and for
+        // +-Inf lower/trim/length/round/... stay NOT NULL, so isnull(f(x)) matches isnull(x).
+        // IN lists and LIKE / GLOB (agent round 6). Left out: like-self (NULL LIKE NULL is NULL),
         //  and every rule turning a one-element IN into a longer list or back. SQLite reads
         //  x IN (constant) as x = +constant, so an explicit COLLATE on the constant decides it, while
         //  a longer list uses x's collation only (datatype3 7.1); those rules fail on that alone.

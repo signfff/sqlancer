@@ -119,6 +119,23 @@ fn preprocess_unquoted_sql(input: &str) -> String {
         })
         .to_string();
 
+    // The workload prints binary comparisons as ((l)OP(r)) with no spaces around OP, so `x IS y`
+    // and `x IS NOT y` reach us as `x IS(y)` and `x IS NOT(y)`. RE_IS needs whitespace after IS
+    // and reads the bare NOT of the second shape as its next token, so both slipped through and
+    // sqlparser refused a '(' right after IS. SQLite reads IS and IS NOT DISTINCT FROM as the same
+    // comparison either way.
+    static RE_IS_PAREN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)\bIS(\s+NOT)?\("#).unwrap());
+    let s = RE_IS_PAREN
+        .replace_all(&s, |c: &regex::Captures| {
+            if c.get(1).is_some() {
+                "IS DISTINCT FROM (".to_string()
+            } else {
+                "IS NOT DISTINCT FROM (".to_string()
+            }
+        })
+        .to_string();
+
     // SQLite allows an empty list, `x IN ()`, and sqlparser does not: it was the commonest refusal
     // of the 2026-10-07 long run (2265 logged). An empty subquery is the same set - x IN () is 0
     // and x NOT IN () is 1 for every x, NULL included, measured both ways.
@@ -378,6 +395,21 @@ mod tests {
         let variants = generate_variants_for_sql("SELECT * FROM t2 WHERE t2.c0 = 'K0X3O'");
         assert!(!variants.is_empty());
         assert!(variants.iter().all(|v| !v.contains("0x3O")));
+    }
+
+    #[test]
+    fn accepts_is_with_parenthesized_operand() {
+        // The workload prints binary comparisons as ((l)OP(r)) with no spaces around OP, so
+        // `x IS y` arrives as `x IS(y)`; sqlparser refused a '(' right after IS.
+        let sql = "SELECT c0 FROM t0 WHERE ((c0)IS((c1)))";
+        assert!(preprocess_sqlite_sql(sql).contains("IS NOT DISTINCT FROM ("), "{sql}");
+        let _ = parse_one(sql);
+        let sql = "SELECT c0 FROM t0 WHERE ((c0)IS NOT((c1)))";
+        assert!(preprocess_sqlite_sql(sql).contains("IS DISTINCT FROM ("), "{sql}");
+        let _ = parse_one(sql);
+        // The spaced spellings keep working through RE_IS.
+        let _ = parse_one("SELECT c0 FROM t0 WHERE c0 IS (c1)");
+        let _ = parse_one("SELECT c0 FROM t0 WHERE c0 IS NOT (c1)");
     }
 
     #[test]
