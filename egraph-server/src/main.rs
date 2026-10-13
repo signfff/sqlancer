@@ -157,8 +157,17 @@ fn preprocess_unquoted_sql(input: &str) -> String {
     static RE_GLOB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bGLOB\b"#).unwrap());
     let s = RE_GLOB.replace_all(&s, "SIMILAR TO").to_string();
 
-    static RE_EMPTY_IN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bIN\s*\(\s*\)"#).unwrap());
-    let s = RE_EMPTY_IN.replace_all(&s, "IN (SELECT 1 WHERE 0)").to_string();
+    // SQLite rewrites `x IN ()` / `x NOT IN ()` at parse time into the boolean constants
+    // FALSE / TRUE (parse.y, "expr1 IN ()"), and `x IS <boolean>` is then a truth-value test,
+    // not a value comparison: `'8' IS (5 IN ())` compiles to IsTrue('8') while `'8' IS 0` does
+    // not, and only a TRUEFALSE on the RIGHT of IS folds that way (`FALSE IS x` stays a value
+    // comparison). Spelling the empty list as an empty subquery kept the value but lost the
+    // constant, so IS/IS NOT over it diverged from SQLite for text operands. Replacing the whole
+    // `operand IN ()` with FALSE reproduces SQLite's own rewrite (the operand is dead either way:
+    // SQLite folds `FALSE AND x` to FALSE), and the IS fold then sees the same constant SQLite
+    // builds. Where the operand cannot be delimited safely the text is left alone for the
+    // sqlparser refusal path.
+    let s = rewrite_empty_in(&s);
 
     static RE_0X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\b0X([0-9a-fA-F]+)"#).unwrap());
     let s = RE_0X.replace_all(&s, "0x$1").to_string();
@@ -169,6 +178,258 @@ fn preprocess_unquoted_sql(input: &str) -> String {
     static RE_NOT_INDEXED: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"(?i)\s+NOT\s+INDEXED\b"#).unwrap());
     RE_NOT_INDEXED.replace_all(&s, "").to_string()
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Byte offset of the next keyword occurrence in `input`, matched case-insensitively with word
+/// boundaries on both sides, or None. The returned offset and `offset + kw.len()` are char
+/// boundaries (both bytes are ASCII), and `offset + 1..` scanning is byte-based but only ever
+/// matches ASCII, so it never splits a UTF-8 character.
+fn find_keyword(input: &str, kw: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let k = kw.as_bytes();
+    if k.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    while i + k.len() <= bytes.len() {
+        let matches = (0..k.len()).all(|j| bytes[i + j].eq_ignore_ascii_case(&k[j]));
+        if matches && (i == 0 || !is_word_byte(bytes[i - 1]))
+            && (i + k.len() == bytes.len() || !is_word_byte(bytes[i + k.len()]))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip ASCII whitespace forward from `start`; the position of the first non-whitespace byte, or
+/// None when the rest of the input is whitespace.
+fn skip_ws(input: &str, mut start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    while start < bytes.len() && matches!(bytes[start], b' ' | b'\t' | b'\r' | b'\n') {
+        start += 1;
+    }
+    (start < bytes.len()).then_some(start)
+}
+
+/// Walk backwards over identifier bytes and dots, from byte position `end` down to the start of
+/// the token. Handles `t1.c0` and decimal numbers like `5.5`.
+fn walk_back_ident(input: &str, mut end: usize) -> usize {
+    let bytes = input.as_bytes();
+    while end > 0 && (is_word_byte(bytes[end - 1]) || bytes[end - 1] == b'.') {
+        end -= 1;
+    }
+    end
+}
+
+/// The operand atom directly left of the byte position `end` (which points at the start of the
+/// `IN` keyword, after any whitespace has been skipped): a parenthesised group (with an optional
+/// function-name prefix), a bracket identifier, a masked quoted string (`\x01N\x02`, with an
+/// optional `x` blob prefix), or a bare identifier/number. Returns the half-open span of the atom.
+/// The input is the quote-masked SQL, so no quote handling is needed here.
+fn operand_atom_backwards(input: &str, end: usize) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
+    let mut e = end;
+    while e > 0 && matches!(bytes[e - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        e -= 1;
+    }
+    if e == 0 {
+        return None;
+    }
+    let c = bytes[e - 1];
+    let s = match c {
+        b')' => {
+            let mut depth = 0usize;
+            let mut j = e;
+            loop {
+                if j == 0 {
+                    return None; // unbalanced
+                }
+                match bytes[j - 1] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j -= 1;
+            }
+            let mut s = j - 1;
+            // A function call: `count(...)` - the name sits directly before the `(`. NOT is not
+            // a function name: `NOT (5) IN ()` is NOT ((5) IN ()), and swallowing the NOT would
+            // replace the whole thing with FALSE where SQLite has NOT FALSE.
+            if s > 0 && is_word_byte(bytes[s - 1]) {
+                let w = walk_back_ident(input, s);
+                if !input[w..s].eq_ignore_ascii_case("NOT") {
+                    s = w;
+                }
+            }
+            s
+        }
+        b']' => {
+            let mut j = e - 1;
+            loop {
+                if j == 0 {
+                    return None; // unbalanced
+                }
+                if bytes[j - 1] == b'[' {
+                    break;
+                }
+                j -= 1;
+            }
+            j - 1
+        }
+        b'\x02' => {
+            // Masked quoted string placeholder: \x01<digits>\x02.
+            let mut j = e - 1;
+            while j > 0 && bytes[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j == 0 || bytes[j - 1] != b'\x01' {
+                return None;
+            }
+            let mut s = j - 1;
+            // A blob literal: the `x` of x'...' sits directly before the placeholder. NOT is
+            // excluded for the same reason as in the group branch above.
+            if s > 0 && is_word_byte(bytes[s - 1]) {
+                let w = walk_back_ident(input, s);
+                if !input[w..s].eq_ignore_ascii_case("NOT") {
+                    s = w;
+                }
+            }
+            s
+        }
+        _ if is_word_byte(c) || c == b'.' => walk_back_ident(input, e),
+        _ => return None,
+    };
+    Some((s, e))
+}
+
+/// Whether the token left of the captured operand atom can start a new expression at a looser
+/// precedence, so that the atom really is the whole left operand of the empty IN. `x IS NOT NULL
+/// IN ()` folds to FALSE as one unit (IS sits at the same precedence as IN and is left-associative),
+/// so a word from the IS/IN/LIKE/BETWEEN family, or anything unrecognised, is refused and the text
+/// is left alone for the sqlparser refusal path.
+fn operand_left_neighbour_is_safe(input: &str, atom_start: usize) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = atom_start;
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        i -= 1;
+    }
+    if i == 0 {
+        return true; // start of the input
+    }
+    let b = bytes[i - 1];
+    if is_word_byte(b) {
+        let w = walk_back_ident(input, i);
+        let word = &input[w..i];
+        if word.eq_ignore_ascii_case("NOT") {
+            // NOT is the loose negation (`NOT x IN ()` is NOT (x IN ())) unless it is the NOT
+            // of an IS NOT at the same precedence.
+            let mut j = w;
+            while j > 0 && matches!(bytes[j - 1], b' ' | b'\t' | b'\r' | b'\n') {
+                j -= 1;
+            }
+            let w2 = walk_back_ident(input, j);
+            return w2 == j || !input[w2..j].eq_ignore_ascii_case("IS");
+        }
+        return matches!(
+            word.to_ascii_uppercase().as_str(),
+            "AND"
+                | "OR"
+                | "WHERE"
+                | "ON"
+                | "WHEN"
+                | "THEN"
+                | "ELSE"
+                | "CASE"
+                | "HAVING"
+                | "RETURNING"
+                | "SET"
+                | "BY"
+                | "AS"
+                | "SELECT"
+                | "ALL"
+                | "DISTINCT"
+                | "LIMIT"
+                | "OFFSET"
+        );
+    }
+    matches!(b, b'(' | b',' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'~')
+}
+
+/// Rewrites `x IN ()` / `x NOT IN ()` to FALSE / TRUE, replicating what SQLite's parser itself
+/// does with an empty list (parse.y: "expr1 IN ()" becomes a TK_TRUEFALSE constant, and `x IS
+/// <boolean>` is then a truth-value test: `'8' IS (5 IN ())` compiles to IsTrue('8') while
+/// `'8' IS 0` does an Eq, and only a constant on the RIGHT of IS folds that way). Spelling the
+/// empty list as an empty subquery kept the value but lost the constant, which diverged for text
+/// operands. The operand is replaced along with the IN because SQLite discards it too (a
+/// function-carrying operand survives as `FALSE AND x`, which the planner folds to FALSE). The
+/// rewrite only goes through when the operand is a single atom whose left neighbour cannot extend
+/// it at IS/IN precedence; otherwise the text is left untouched for the sqlparser refusal path.
+fn rewrite_empty_in(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut pos = 0usize; // scan cursor
+    let mut copied = 0usize; // everything before this is already in `out`
+    loop {
+        let Some(rel) = find_keyword(&input[pos..], "IN") else {
+            break;
+        };
+        let kstart = pos + rel;
+        let kend = kstart + 2;
+        let Some(after) = skip_ws(input, kend) else {
+            break;
+        };
+        if input.as_bytes()[after] != b'(' {
+            pos = kend;
+            continue;
+        }
+        let Some(inner) = skip_ws(input, after + 1) else {
+            pos = after + 1;
+            continue;
+        };
+        if input.as_bytes()[inner] != b')' {
+            pos = inner;
+            continue;
+        }
+        let pend = inner + 1; // one past "IN ()"
+        // The atom left of IN: either the operand itself, or the NOT of `x NOT IN ()`.
+        let Some((s, e)) = operand_atom_backwards(input, kstart) else {
+            pos = kend;
+            continue;
+        };
+        let atom_is_not = input[s..e].eq_ignore_ascii_case("NOT");
+        let (s, safe) = if atom_is_not {
+            // NOT IN (): the real operand sits left of the NOT.
+            match operand_atom_backwards(input, s) {
+                Some((s2, _)) => (s2, operand_left_neighbour_is_safe(input, s2)),
+                None => {
+                    pos = kend;
+                    continue;
+                }
+            }
+        } else {
+            (s, operand_left_neighbour_is_safe(input, s))
+        };
+        if !safe {
+            pos = kend;
+            continue;
+        }
+        out.push_str(&input[copied..s]);
+        out.push_str(if atom_is_not { "TRUE" } else { "FALSE" });
+        copied = pend;
+        pos = pend;
+    }
+    out.push_str(&input[copied..]);
+    out
 }
 
 async fn generate_variants(Json(req): Json<GenerateRequest>) -> impl IntoResponse {
@@ -440,6 +701,62 @@ mod tests {
     }
 
     #[test]
+    fn empty_in_becomes_the_boolean_constant_sqlite_builds() {
+        // SQLite rewrites x IN () to the constant FALSE at parse time (x NOT IN () to TRUE) and
+        // discards the operand; replicating that keeps `x IS (y IN ())` on SQLite's truth-test
+        // semantics instead of a value comparison against 0.
+        let cases = [
+            ("SELECT * FROM t0 WHERE (c0 IN ())", "WHERE (FALSE)"),
+            ("SELECT * FROM t0 WHERE x NOT IN ()", "WHERE TRUE"),
+            ("SELECT * FROM t0 WHERE NOT (5) IN ()", "WHERE NOT FALSE"),
+            ("SELECT * FROM t0 WHERE count(x) IN ()", "WHERE FALSE"),
+            ("SELECT * FROM t0 WHERE 'str' IN ()", "WHERE FALSE"),
+            ("SELECT * FROM t0 WHERE NOT(5 IN ())", "WHERE NOT(FALSE)"),
+            // IN binds tighter than prefix -, so SQLite reads -(2105896977 IN ()) and -FALSE
+            // is exactly what it computes; the group parens stay outside the operand.
+            ("SELECT * FROM t0 WHERE (-2105896977 IN ())", "WHERE (-FALSE)"),
+            ("SELECT * FROM t0 WHERE -2105896977 IN ()", "WHERE -FALSE"),
+        ];
+        for (sql, want) in cases {
+            let p = preprocess_sqlite_sql(sql);
+            assert!(p.contains(want), "{sql} -> {p}");
+        }
+        // The operand cannot be delimited safely, or the list is not empty: left for the parser.
+        for sql in [
+            "SELECT * FROM t0 WHERE a IS NOT NULL IN ()",
+            "SELECT * FROM t0 WHERE a IN b IN ()",
+        ] {
+            assert!(preprocess_sqlite_sql(sql).contains("IN ()"), "{sql}");
+        }
+        assert_eq!(
+            preprocess_sqlite_sql("SELECT * FROM t0 WHERE c0 IN (1)"),
+            "SELECT * FROM t0 WHERE c0 IN (1)"
+        );
+    }
+
+    #[test]
+    fn is_over_an_empty_in_folds_like_sqlite() {
+        let sql = "SELECT c0 FROM t0 WHERE '8' IS (c0 IN ())";
+        let p = preprocess_sqlite_sql(sql);
+        assert!(p.contains("IS NOT DISTINCT FROM (FALSE)"), "{p}");
+        let variants = generate_variants_for_sql(sql);
+        assert!(!variants.is_empty(), "{}", p);
+        assert!(
+            variants.iter().all(|v| !v.contains("IN (SELECT 1 WHERE 0)")),
+            "{:?}",
+            variants
+        );
+        let sql = "SELECT c0 FROM t0 WHERE c0 IS NOT ((-2105896977 IN ()))";
+        let variants = generate_variants_for_sql(sql);
+        assert!(!variants.is_empty());
+        assert!(
+            variants.iter().all(|v| !v.contains("IN (SELECT 1 WHERE 0)")),
+            "{:?}",
+            variants
+        );
+    }
+
+    #[test]
     fn refuses_operators_sqlparser_groups_differently() {
         let refused = [
             "SELECT * FROM t0, t1 WHERE t0.c0 = t1.c1 < t0.c2",
@@ -465,7 +782,10 @@ mod tests {
     }
 
     fn parse_one(sql: &str) -> Statement {
-        Parser::parse_sql(&GenericDialect {}, &preprocess_sqlite_sql(sql)).unwrap().remove(0)
+        let pre = preprocess_sqlite_sql(sql);
+        Parser::parse_sql(&GenericDialect {}, &pre)
+            .unwrap_or_else(|e| panic!("{sql} -> {pre}: {e}"))
+            .remove(0)
     }
 
     #[test]

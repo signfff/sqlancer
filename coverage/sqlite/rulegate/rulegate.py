@@ -37,7 +37,13 @@ LITERALS = ["NULL", "0", "1", "-1", "2", "9223372036854775807", "-92233720368547
             # istrue-lower failed on exactly this (trunk-optmask11). 'inf'/'nan' as text cast to 0.0,
             # '0x10' casts to 0.0 while its numeric prefix is 0, and '12.5abc' casts by prefix.
             "'1e999'", "'-1e999'", "'inf'", "'nan'", "'0x10'", "' 0x10'", "'99999999999999999999'",
-            "'2.5e-999'", "'12.5abc'", "x'3130'"]
+            "'2.5e-999'", "'12.5abc'", "x'3130'",
+            # Boolean constants, 2026-10-13: the server now reproduces SQLite's `x IN ()` -> FALSE
+            # parse-time rewrite, so rules meet literal TRUE/FALSE (also on the right of IS via
+            # is-sym from `FALSE IS x`). SQLite folds a boolean constant on the RIGHT of IS into the
+            # IS TRUE family; the server's printer moves it to the LEFT (to_sql models that below),
+            # where SQLite value-compares it like any other number.
+            "TRUE", "FALSE"]
 COLUMNS = ["c_int", "c_real", "c_text", "c_blob", "c_num", "c_any", "c_nocase", "c_rtrim"]
 EXPLICIT = "COLL"  # (vN.c_text COLLATE NOCASE)
 SCHEMA = ("CREATE TABLE v(c_int INTEGER, c_real REAL, c_text TEXT, c_blob BLOB, c_num NUMERIC, c_any, "
@@ -112,6 +118,18 @@ def variables(tree, out=None):
     return out
 
 
+def _is_boolean_literal(text):
+    # SQLite's IS fold sees through parens and COLLATE: `x IS (TRUE COLLATE NOCASE)` folds like
+    # `x IS TRUE` (measured on trunk), so the server printer swaps those off the right of IS too.
+    t = text.strip()
+    while True:
+        m = re.match(r"^\((.*)\)$", t)
+        if not m:
+            break
+        t = m.group(1).strip()
+    return re.match(r"^(?:TRUE|FALSE)(?: COLLATE \w+)*$", t) is not None
+
+
 def to_sql(tree, binding):
     if isinstance(tree, str):
         if tree.startswith("?"):
@@ -129,6 +147,11 @@ def to_sql(tree, binding):
     # Nodes the server's language does not have yet, so candidate rules that need them can be
     # judged before anyone implements them.
     if op in EXTENSION:
+        # SQLite folds `x IS <TRUE/FALSE constant>` into the truth-value test, discarding x; the
+        # server's printer moves a boolean literal off the right of IS/IS NOT (where the fold would
+        # fire) to the left (where SQLite value-compares it), so the gate spells it the same way.
+        if op in ("is", "isnot") and _is_boolean_literal(args[1]) and not _is_boolean_literal(args[0]):
+            args[0], args[1] = args[1], args[0]
         return EXTENSION[op].format(*args)
     if op.startswith("fn:"):
         return "%s(%s)" % (op[3:], ", ".join(args))
@@ -159,7 +182,9 @@ def produces_value(tree):
 # Literals carrying an explicit COLLATE: a constant behaves unlike a column in places (SQLite turns
 # x IN (constant) into x = +constant, and the constant's COLLATE then decides), and the column with
 # an explicit COLLATE alone missed that - in2-dup-to-in1 passed against the IN bug of 2026-10-08.
-COLLATED_LITERALS = ["('ABC' COLLATE NOCASE)", "('a ' COLLATE RTRIM)", "(1 COLLATE NOCASE)"]
+COLLATED_LITERALS = ["('ABC' COLLATE NOCASE)", "('a ' COLLATE RTRIM)", "(1 COLLATE NOCASE)",
+                     # Booleans under COLLATE: SQLite's IS fold looks through the collate (2026-10-13).
+                     "(TRUE COLLATE NOCASE)", "(FALSE COLLATE BINARY)"]
 
 
 def options():

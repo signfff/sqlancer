@@ -19,7 +19,9 @@ import urllib.request
 from collections import Counter
 
 VALUES = ["NULL", "0", "1", "-1", "2", "9223372036854775807", "-9223372036854775808", "0.5", "1.0", "-0.0",
-          "1e308", "'abc'", "'ABC'", "''", "'1'", "' 1'", "'1.0'", "'a '", "x''", "x'31'"]
+          "1e308", "'abc'", "'ABC'", "''", "'1'", "' 1'", "'1.0'", "'a '", "x''", "x'31'",
+          # 2026-10-13: the IN () -> FALSE rewrite lets the workload's IS/IS NOT meet boolean constants.
+          "TRUE", "FALSE"]
 COLUMNS = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"]
 SCHEMA = ("CREATE TABLE t0(c0 INTEGER, c1 REAL, c2 TEXT, c3 BLOB, c4 NUMERIC, c5, c6 TEXT COLLATE NOCASE, "
           "c7 TEXT COLLATE RTRIM)")
@@ -161,6 +163,7 @@ def main():
     gen = Gen(rnd, features)
     stats = Counter()
     mismatches = []
+    varerrs = []
     for _ in range(args.n):
         pred = gen.pred(args.depth)
         sql = "SELECT rowid FROM t0 WHERE %s" % pred
@@ -181,6 +184,7 @@ def main():
             got, verr = rows(db, v)
             if verr:
                 stats["variant errors"] += 1
+                varerrs.append((sql, v, verr))
                 continue
             if got != expected:
                 mismatches.append({"original": sql, "variant": v, "expected": expected, "got": got})
@@ -193,6 +197,8 @@ def main():
     print("%6d  MISMATCHES" % len(mismatches))
     for m in mismatches[:10]:
         print("--\n%s\n%s\n%s vs %s" % (m["original"], m["variant"], m["expected"], m["got"]))
+    for sql, v, verr in varerrs[:3]:
+        print("-- variant error\n%s\n%s\n%s" % (sql, v, verr))
     sys.exit(1 if mismatches else 0)
 
 

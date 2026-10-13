@@ -587,6 +587,37 @@ fn make_symbol(
     id
 }
 
+/// The TRUE/FALSE constant behind an expression, through any parens and COLLATE (both transparent
+/// in SQLite's IS fold: measured on trunk, `'1' IS NOT (TRUE COLLATE NOCASE)` compiles to the
+/// truth-value test like `'1' IS NOT (TRUE)` - sqlite3ExprSkipCollate strips the collate before
+/// the TRUEFALSE check, and the collation name never matters). None for anything else: CAST does
+/// not fold, and neither does TRUE+0, NOT FALSE or -TRUE.
+fn as_boolean_literal(expr: &SqlExpr) -> Option<bool> {
+    match expr {
+        SqlExpr::Value(v) => match v.value {
+            Value::Boolean(b) => Some(b),
+            _ => None,
+        },
+        SqlExpr::Nested(inner) => as_boolean_literal(inner),
+        SqlExpr::Collate { expr, .. } => as_boolean_literal(expr),
+        _ => None,
+    }
+}
+
+/// Whether an egraph node id holds a literal TRUE/FALSE symbol, possibly under a COLLATE node
+/// (SQLite's fold looks through the collate there too). Printing a `Literal IS node` keeps the
+/// node's value-comparison semantics only when the literal is NOT on the right (SQLite folds a
+/// right-side literal into the IS TRUE/FALSE family), so the printer swaps in that case.
+fn symbol_is_boolean_literal(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTable) -> bool {
+    match &expr[id] {
+        SqlLang::Symbol(k) => matches!(symbols.get(k), Some(e) if as_boolean_literal(e).is_some()),
+        SqlLang::CollateBinary([c]) | SqlLang::CollateNocase([c]) | SqlLang::CollateRtrim([c]) => {
+            symbol_is_boolean_literal(expr, *c, symbols)
+        }
+        _ => false,
+    }
+}
+
 fn sql_expr_to_recexpr_impl(
     expr: &SqlExpr,
     rec: &mut RecExpr<SqlLang>,
@@ -773,16 +804,33 @@ fn sql_expr_to_recexpr_impl(
         }
 
         // SQLite's `x IS y` / `x IS NOT y`, which preprocessing spells IS [NOT] DISTINCT FROM for
-        // sqlparser.
+        // sqlparser. SQLite folds `x IS <TRUE/FALSE constant>` into the truth-value test: measured
+        // on trunk, `'abc' IS (5 IN ())` compiles to IsTrue('abc') (P3=1,P4=1: IS FALSE) while
+        // `'abc' IS 0` does an Eq, and the fold fires only for a constant on the RIGHT (FALSE IS x
+        // stays a value comparison). IS NOT DISTINCT FROM is TK_IS and IS DISTINCT FROM is TK_ISNOT,
+        // so the same fold applies: NDF FALSE -> IS FALSE, NDF TRUE -> IS TRUE, DF FALSE -> IS NOT
+        // FALSE, DF TRUE -> IS NOT TRUE.
         SqlExpr::IsNotDistinctFrom(left, right) => {
             let l = sql_expr_to_recexpr_impl(left, rec, symbols, counter, dedup, source_sql);
-            let r = sql_expr_to_recexpr_impl(right, rec, symbols, counter, dedup, source_sql);
-            rec.add(SqlLang::Is([l, r]))
+            match as_boolean_literal(right) {
+                Some(false) => rec.add(SqlLang::IsFalse([l])),
+                Some(true) => rec.add(SqlLang::IsTrue([l])),
+                None => {
+                    let r = sql_expr_to_recexpr_impl(right, rec, symbols, counter, dedup, source_sql);
+                    rec.add(SqlLang::Is([l, r]))
+                }
+            }
         }
         SqlExpr::IsDistinctFrom(left, right) => {
             let l = sql_expr_to_recexpr_impl(left, rec, symbols, counter, dedup, source_sql);
-            let r = sql_expr_to_recexpr_impl(right, rec, symbols, counter, dedup, source_sql);
-            rec.add(SqlLang::IsNot([l, r]))
+            match as_boolean_literal(right) {
+                Some(false) => rec.add(SqlLang::IsNotFalse([l])),
+                Some(true) => rec.add(SqlLang::IsNotTrue([l])),
+                None => {
+                    let r = sql_expr_to_recexpr_impl(right, rec, symbols, counter, dedup, source_sql);
+                    rec.add(SqlLang::IsNot([l, r]))
+                }
+            }
         }
 
         // coalesce / ifnull with two arguments, nullif, and iif (SQLite's own spelling of a one-WHEN
@@ -1376,15 +1424,36 @@ fn recexpr_to_sql_expr_impl(expr: &RecExpr<SqlLang>, id: Id, symbols: &SymbolTab
             recexpr_to_sql_expr_impl(expr, *c, symbols),
         ))),
         // Printed as IS [NOT] DISTINCT FROM, which SQLite has accepted since 3.39 with the same
-        // meaning as IS [NOT].
-        SqlLang::Is([l, r]) => SqlExpr::IsNotDistinctFrom(
-            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
-            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
-        ),
-        SqlLang::IsNot([l, r]) => SqlExpr::IsDistinctFrom(
-            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *l, symbols))),
-            Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, *r, symbols))),
-        ),
+        // meaning as IS [NOT]. A TRUE/FALSE literal on the RIGHT would make SQLite fold the print
+        // into a truth-value test (IS FALSE and friends) while the value comparison is what the
+        // evaluator models, so the literal goes LEFT where SQLite value-compares (FALSE IS x stays
+        // an Eq). Two literals agree either way.
+        SqlLang::Is([l, r]) => {
+            let (l, r) = if symbol_is_boolean_literal(expr, *r, symbols)
+                && !symbol_is_boolean_literal(expr, *l, symbols)
+            {
+                (*r, *l)
+            } else {
+                (*l, *r)
+            };
+            SqlExpr::IsNotDistinctFrom(
+                Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, l, symbols))),
+                Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, r, symbols))),
+            )
+        }
+        SqlLang::IsNot([l, r]) => {
+            let (l, r) = if symbol_is_boolean_literal(expr, *r, symbols)
+                && !symbol_is_boolean_literal(expr, *l, symbols)
+            {
+                (*r, *l)
+            } else {
+                (*l, *r)
+            };
+            SqlExpr::IsDistinctFrom(
+                Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, l, symbols))),
+                Box::new(wrap_compound(recexpr_to_sql_expr_impl(expr, r, symbols))),
+            )
+        }
         SqlLang::CastInt([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "INTEGER"),
         SqlLang::CastReal([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "REAL"),
         SqlLang::CastText([x]) => cast_to(recexpr_to_sql_expr_impl(expr, *x, symbols), "TEXT"),
@@ -2564,10 +2633,12 @@ fn eval(
             o != std::cmp::Ordering::Less
         }),
 
-        //  Arithmetic: NULL if any operand is NULL
-        SqlLang::Add([l, r]) => arith2(expr, *l, *r, symbols, assignment, |a, b| a + b),
-        SqlLang::Sub([l, r]) => arith2(expr, *l, *r, symbols, assignment, |a, b| a - b),
-        SqlLang::Mul([l, r]) => arith2(expr, *l, *r, symbols, assignment, |a, b| a * b),
+        //  Arithmetic: NULL if any operand is NULL. Wrapping, like Div below: SQLite would return
+        // a REAL on overflow, but this approximate evaluator has no REAL; panicking on i64 extremes
+        // (e2e value pool has both ends) refused the whole query for nothing.
+        SqlLang::Add([l, r]) => arith2(expr, *l, *r, symbols, assignment, |a, b| a.wrapping_add(b)),
+        SqlLang::Sub([l, r]) => arith2(expr, *l, *r, symbols, assignment, |a, b| a.wrapping_sub(b)),
+        SqlLang::Mul([l, r]) => arith2(expr, *l, *r, symbols, assignment, |a, b| a.wrapping_mul(b)),
         // Division by zero is NULL in SQLite, not a number. Returning i64::MAX made the two sides
         // of a rewrite agree on a value that never occurs.
         SqlLang::Div([l, r]) => {
@@ -2581,7 +2652,7 @@ fn eval(
         SqlLang::Neg([c]) => {
             let cv = eval(expr, *c, symbols, assignment);
             match sqlvalue_to_int(&cv) {
-                Some(i) => SqlValue::Int(-i),
+                Some(i) => SqlValue::Int(i.wrapping_neg()),
                 None => SqlValue::Null,
             }
         }
@@ -4134,6 +4205,80 @@ mod tests {
             },
             _ => panic!("not a query"),
         }
+    }
+
+    #[test]
+    fn boolean_literals_on_the_right_of_is_desugar_like_sqlite_folds() {
+        // SQLite compiles `x IS <TRUE/FALSE constant>` into the truth-value test (IS FALSE and
+        // friends) but `x IS 0` into a value comparison, and the fold only fires for a constant on
+        // the RIGHT (`FALSE IS x` stays a value comparison): measured on trunk with opcode P3/P4.
+        let e = parse_predicate("SELECT * FROM t0 WHERE '8' IS NOT DISTINCT FROM (FALSE)");
+        let (rec, _) = sql_expr_to_recexpr(&e, "");
+        assert!(matches!(rec.as_ref().last().unwrap(), SqlLang::IsFalse(_)));
+        let e = parse_predicate("SELECT * FROM t0 WHERE c0 IS DISTINCT FROM (TRUE)");
+        let (rec, _) = sql_expr_to_recexpr(&e, "");
+        assert!(matches!(rec.as_ref().last().unwrap(), SqlLang::IsNotTrue(_)));
+        let e = parse_predicate("SELECT * FROM t0 WHERE c0 IS NOT DISTINCT FROM c1");
+        let (rec, _) = sql_expr_to_recexpr(&e, "");
+        assert!(matches!(rec.as_ref().last().unwrap(), SqlLang::Is(_)));
+        // A literal on the LEFT keeps value-comparison semantics, exactly like SQLite.
+        let e = parse_predicate("SELECT * FROM t0 WHERE FALSE IS NOT DISTINCT FROM c0");
+        let (rec, _) = sql_expr_to_recexpr(&e, "");
+        assert!(matches!(rec.as_ref().last().unwrap(), SqlLang::Is(_)));
+    }
+
+    #[test]
+    fn printing_moves_a_boolean_literal_off_the_is_right() {
+        // Rules can build IS/IS NOT with a literal TRUE/FALSE on the right; printing that back
+        // would make SQLite fold the right side into the IS TRUE family instead of value-comparing
+        // (the left operand is dead weight in the fold), so the printer swaps the literal left.
+        let mut rec = RecExpr::default();
+        let x = rec.add(SqlLang::Symbol(0));
+        let t = rec.add(SqlLang::Symbol(1));
+        let f = rec.add(SqlLang::Symbol(2));
+        let is_t = rec.add(SqlLang::Is([x, t]));
+        let isnot_f = rec.add(SqlLang::IsNot([x, f]));
+        let both = rec.add(SqlLang::Is([t, f]));
+        let plain = rec.add(SqlLang::Is([x, x]));
+        let mut symbols = SymbolTable::new();
+        symbols.insert(0, SqlExpr::Identifier(Ident::new("c0")));
+        symbols.insert(1, SqlExpr::Value(Value::Boolean(true).into()));
+        symbols.insert(2, SqlExpr::Value(Value::Boolean(false).into()));
+        // sqlparser prints boolean literals lowercase; SQLite accepts either spelling.
+        assert_eq!(
+            format!("{}", recexpr_to_sql_expr_impl(&rec, is_t, &symbols)),
+            "true IS NOT DISTINCT FROM c0"
+        );
+        assert_eq!(
+            format!("{}", recexpr_to_sql_expr_impl(&rec, isnot_f, &symbols)),
+            "false IS DISTINCT FROM c0"
+        );
+        // Two literals agree either way, and no swap happens without a literal.
+        assert_eq!(
+            format!("{}", recexpr_to_sql_expr_impl(&rec, both, &symbols)),
+            "true IS NOT DISTINCT FROM false"
+        );
+        assert_eq!(
+            format!("{}", recexpr_to_sql_expr_impl(&rec, plain, &symbols)),
+            "c0 IS NOT DISTINCT FROM c0"
+        );
+        // A literal under COLLATE folds in SQLite too (`'1' IS NOT (TRUE COLLATE NOCASE)` measured
+        // on trunk), so both the desugar and the swap look through the collate node.
+        let e = parse_predicate("SELECT * FROM t0 WHERE c0 IS DISTINCT FROM (TRUE COLLATE NOCASE)");
+        let (rec, _) = sql_expr_to_recexpr(&e, "");
+        assert!(matches!(rec.as_ref().last().unwrap(), SqlLang::IsNotTrue(_)));
+        let mut rec = RecExpr::default();
+        let x = rec.add(SqlLang::Symbol(0));
+        let t_sym = rec.add(SqlLang::Symbol(1));
+        let ct = rec.add(SqlLang::CollateBinary([t_sym]));
+        let is_ct = rec.add(SqlLang::Is([x, ct]));
+        let mut symbols = SymbolTable::new();
+        symbols.insert(0, SqlExpr::Identifier(Ident::new("c0")));
+        symbols.insert(1, SqlExpr::Value(Value::Boolean(true).into()));
+        assert_eq!(
+            format!("{}", recexpr_to_sql_expr_impl(&rec, is_ct, &symbols)),
+            "(true COLLATE BINARY) IS NOT DISTINCT FROM c0"
+        );
     }
 
     #[test]
