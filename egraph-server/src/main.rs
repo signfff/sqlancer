@@ -153,9 +153,20 @@ fn preprocess_unquoted_sql(input: &str) -> String {
         .to_string();
     // GLOB is SQLite's; sqlparser has no such operator and refused every query with one. It does
     // have SIMILAR TO, which SQLite has not and which sits at the same precedence as LIKE, so GLOB
-    // travels under that name and restore_glob gives it back on the way out.
+    // travels under that name and restore_glob gives it back on the way out. The infix operator
+    // sits after an expression, while `glob(x, y)` the two-argument function sits where an
+    // expression starts - only the operator is translated, the function name stays.
     static RE_GLOB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bGLOB\b"#).unwrap());
-    let s = RE_GLOB.replace_all(&s, "SIMILAR TO").to_string();
+    let s = RE_GLOB
+        .replace_all(&s, |c: &regex::Captures| {
+            let m = c.get(0).unwrap();
+            if glob_is_function(&s, m.start()) {
+                m.as_str().to_string()
+            } else {
+                "SIMILAR TO".to_string()
+            }
+        })
+        .to_string();
 
     // SQLite rewrites `x IN ()` / `x NOT IN ()` at parse time into the boolean constants
     // FALSE / TRUE (parse.y, "expr1 IN ()"), and `x IS <boolean>` is then a truth-value test,
@@ -184,27 +195,85 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Byte offset of the next keyword occurrence in `input`, matched case-insensitively with word
-/// boundaries on both sides, or None. The returned offset and `offset + kw.len()` are char
-/// boundaries (both bytes are ASCII), and `offset + 1..` scanning is byte-based but only ever
-/// matches ASCII, so it never splits a UTF-8 character.
-fn find_keyword(input: &str, kw: &str) -> Option<usize> {
+/// Whether the GLOB keyword at byte position `at` is the two-argument function `glob(x, y)`
+/// rather than the infix operator `x GLOB y`: the operator follows an expression, the function
+/// sits where an expression starts. `NOT` is transparent (`x NOT GLOB y` negates the operator,
+/// `AND NOT glob(...)` is a function call).
+fn glob_is_function(input: &str, at: usize) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = at;
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        i -= 1;
+    }
+    if i == 0 {
+        return true;
+    }
+    let b = bytes[i - 1];
+    if is_word_byte(b) {
+        let w = walk_back_ident(input, i);
+        if input[w..i].eq_ignore_ascii_case("NOT") {
+            return glob_is_function(input, w);
+        }
+        return matches!(
+            input[w..i].to_ascii_uppercase().as_str(),
+            "AND"
+                | "OR"
+                | "WHERE"
+                | "ON"
+                | "WHEN"
+                | "THEN"
+                | "ELSE"
+                | "CASE"
+                | "HAVING"
+                | "RETURNING"
+                | "SET"
+                | "BY"
+                | "AS"
+                | "SELECT"
+                | "ALL"
+                | "DISTINCT"
+                | "LIMIT"
+                | "OFFSET"
+                // Operator words: after them a GLOB has no left operand, so it is the function.
+                // FROM covers `IS [NOT] DISTINCT FROM glob(...)`: RE_IS rewrites IS before this
+                // step runs. GLOB itself covers `x GLOB glob(a, b)`.
+                | "IS"
+                | "IN"
+                | "LIKE"
+                | "GLOB"
+                | "BETWEEN"
+                | "ISNULL"
+                | "NOTNULL"
+                | "ESCAPE"
+                | "FROM"
+        );
+    }
+    !matches!(b, b')' | b']' | b'\x02')
+}
+
+/// Byte offset of the last keyword occurrence whose span lies within `[0, limit)`, matched
+/// case-insensitively with word boundaries on both sides, or None. The right-boundary check still
+/// looks at `bytes[i + k.len()]` even when that byte sits at or past `limit`, so a keyword split
+/// across the limit (e.g. the IN of INTO) is not matched.
+fn rfind_keyword(input: &str, kw: &str, limit: usize) -> Option<usize> {
     let bytes = input.as_bytes();
     let k = kw.as_bytes();
-    if k.is_empty() {
+    if k.is_empty() || limit < k.len() {
         return None;
     }
-    let mut i = 0;
-    while i + k.len() <= bytes.len() {
+    let mut i = limit - k.len();
+    loop {
         let matches = (0..k.len()).all(|j| bytes[i + j].eq_ignore_ascii_case(&k[j]));
         if matches && (i == 0 || !is_word_byte(bytes[i - 1]))
             && (i + k.len() == bytes.len() || !is_word_byte(bytes[i + k.len()]))
         {
             return Some(i);
         }
-        i += 1;
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
     }
-    None
 }
 
 /// Skip ASCII whitespace forward from `start`; the position of the first non-whitespace byte, or
@@ -375,35 +444,42 @@ fn operand_left_neighbour_is_safe(input: &str, atom_start: usize) -> bool {
 /// function-carrying operand survives as `FALSE AND x`, which the planner folds to FALSE). The
 /// rewrite only goes through when the operand is a single atom whose left neighbour cannot extend
 /// it at IS/IN precedence; otherwise the text is left untouched for the sqlparser refusal path.
+///
+/// Scanned right to left: an outer `IN ()` whose operand spans inner ones (e.g.
+/// `((t1.c0 IN ()) IN ())`) is replaced as one unit first, so the inner `IN ()` inside the
+/// replaced span is never visited and every byte position stays in the original text's
+/// coordinate system (a forward scan replaced the inner one first and then sliced with a
+/// `copied` cursor past the outer operand's start, which panicked).
 fn rewrite_empty_in(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut pos = 0usize; // scan cursor
-    let mut copied = 0usize; // everything before this is already in `out`
-    loop {
-        let Some(rel) = find_keyword(&input[pos..], "IN") else {
+    // (span start, one past the "IN ()" close, replacement) collected right to left; spans never
+    // overlap because each new scan starts left of the previous span.
+    let mut ranges: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut limit = input.len();
+    while limit > 0 {
+        let Some(kstart) = rfind_keyword(input, "IN", limit) else {
             break;
         };
-        let kstart = pos + rel;
         let kend = kstart + 2;
         let Some(after) = skip_ws(input, kend) else {
-            break;
+            limit = kstart;
+            continue;
         };
         if input.as_bytes()[after] != b'(' {
-            pos = kend;
+            limit = kstart;
             continue;
         }
         let Some(inner) = skip_ws(input, after + 1) else {
-            pos = after + 1;
+            limit = kstart;
             continue;
         };
         if input.as_bytes()[inner] != b')' {
-            pos = inner;
+            limit = kstart;
             continue;
         }
         let pend = inner + 1; // one past "IN ()"
         // The atom left of IN: either the operand itself, or the NOT of `x NOT IN ()`.
         let Some((s, e)) = operand_atom_backwards(input, kstart) else {
-            pos = kend;
+            limit = kstart;
             continue;
         };
         let atom_is_not = input[s..e].eq_ignore_ascii_case("NOT");
@@ -412,7 +488,7 @@ fn rewrite_empty_in(input: &str) -> String {
             match operand_atom_backwards(input, s) {
                 Some((s2, _)) => (s2, operand_left_neighbour_is_safe(input, s2)),
                 None => {
-                    pos = kend;
+                    limit = kstart;
                     continue;
                 }
             }
@@ -420,13 +496,18 @@ fn rewrite_empty_in(input: &str) -> String {
             (s, operand_left_neighbour_is_safe(input, s))
         };
         if !safe {
-            pos = kend;
+            limit = kstart;
             continue;
         }
+        ranges.push((s, pend, if atom_is_not { "TRUE" } else { "FALSE" }));
+        limit = s;
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0usize;
+    for (s, pend, replacement) in ranges.into_iter().rev() {
         out.push_str(&input[copied..s]);
-        out.push_str(if atom_is_not { "TRUE" } else { "FALSE" });
+        out.push_str(replacement);
         copied = pend;
-        pos = pend;
     }
     out.push_str(&input[copied..]);
     out
@@ -716,6 +797,12 @@ mod tests {
             // is exactly what it computes; the group parens stay outside the operand.
             ("SELECT * FROM t0 WHERE (-2105896977 IN ())", "WHERE (-FALSE)"),
             ("SELECT * FROM t0 WHERE -2105896977 IN ()", "WHERE -FALSE"),
+            // Nested: the outer IN () spans the inner one and the outer replacement covers both
+            // (SQLite folds (FALSE IN ()) to FALSE). The old forward scan replaced the inner one
+            // first and then sliced with a `copied` cursor past the outer operand's start, which
+            // panicked; the right-to-left scan replaces the outer one as a single unit.
+            ("SELECT * FROM t0 WHERE (((t1.c0 IN ()) IN ()))", "WHERE ((FALSE))"),
+            ("SELECT * FROM t0 WHERE (t1.c0 IN ()) IN ()", "WHERE FALSE"),
         ];
         for (sql, want) in cases {
             let p = preprocess_sqlite_sql(sql);
@@ -754,6 +841,29 @@ mod tests {
             "{:?}",
             variants
         );
+    }
+
+    #[test]
+    fn glob_the_function_survives_but_the_operator_travels_as_similar_to() {
+        // The infix operator is translated to SIMILAR TO (sqlparser has no GLOB); the
+        // two-argument function of the same name must stay intact or every query with one was
+        // refused as `Expected: ), found: TO`.
+        let sql = "SELECT rowid FROM t0 WHERE ((CASE WHEN (t0.c0 IS NULL) THEN ('abc' COLLATE NOCASE) ELSE t0.c1 END) = glob((2 + t0.c2), (' 1' COLLATE BINARY)))";
+        let p = preprocess_sqlite_sql(sql);
+        assert!(p.contains("glob((2 + t0.c2), (' 1' COLLATE BINARY))"), "{p}");
+        assert!(!p.contains("SIMILAR TO"), "{p}");
+        // Operator forms still travel under SIMILAR TO, including the negated one.
+        for sql in ["SELECT * FROM t0 WHERE t0.c2 GLOB 'a*'",
+                    "SELECT * FROM t0 WHERE x NOT GLOB (y IN ())"] {
+            let p = preprocess_sqlite_sql(sql);
+            assert!(p.contains("SIMILAR TO"), "{sql} -> {p}");
+        }
+        // After IS the word has no left operand, so it is the function: `x IS glob(a, b)`.
+        // (RE_IS rewrites IS to IS NOT DISTINCT FROM before this step runs.)
+        let sql = "SELECT rowid FROM t0 WHERE ((t0.c1 || t0.c5) IS glob(t0.c1, t0.c3))";
+        let p = preprocess_sqlite_sql(sql);
+        assert!(p.contains("IS NOT DISTINCT FROM glob(t0.c1, t0.c3)"), "{p}");
+        assert!(!p.contains("SIMILAR TO"), "{p}");
     }
 
     #[test]
