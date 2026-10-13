@@ -119,15 +119,21 @@ def variables(tree, out=None):
 
 
 def _is_boolean_literal(text):
-    # SQLite's IS fold sees through parens and COLLATE: `x IS (TRUE COLLATE NOCASE)` folds like
-    # `x IS TRUE` (measured on trunk), so the server printer swaps those off the right of IS too.
+    # SQLite's IS fold sees through parens and COLLATE chains: `x IS ((TRUE COLLATE NOCASE)
+    # COLLATE NOCASE)` folds like `x IS TRUE` (measured on trunk), and the server printer swaps
+    # those off the right of IS too, so the gate spells it the same way - peel both recursively.
     t = text.strip()
     while True:
         m = re.match(r"^\((.*)\)$", t)
-        if not m:
-            break
-        t = m.group(1).strip()
-    return re.match(r"^(?:TRUE|FALSE)(?: COLLATE \w+)*$", t) is not None
+        if m:
+            t = m.group(1).strip()
+            continue
+        m = re.match(r"^(.*) COLLATE (\w+)$", t)
+        if m:
+            t = m.group(1).strip()
+            continue
+        break
+    return t in ("TRUE", "FALSE")
 
 
 def to_sql(tree, binding):
