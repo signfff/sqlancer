@@ -276,6 +276,7 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             replayQueries.add(originalQuery);
             optMask.apply(state, currentMask);
             for (int i = 0; i < variants.size(); i++) {
+                String rawVariantQuery = selfCompare ? null : variants.get(i);
                 String variantQuery = selfCompare ? originalQuery : generatedQuery.wrapVariant(variants.get(i));
                 if (variantQuery == null || variantQuery.isBlank()
                         || (!selfCompare && variantQuery.equals(originalQuery))) {
@@ -333,7 +334,10 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                                     "The size of the result sets mismatch (%d and %d)!%nFirst query: \"%s\"%nSecond query: \"%s\"",
                                     originalResult.size(), variantResult.size(), originalQuery, variantQuery));
                         }
-                    } else {
+                    } else if (!isWrapperRepresentativeChoice(originalQuery, variantQuery, rewriteQuery,
+                            rawVariantQuery, originalResult, variantResult)) {
+                        // When the gate answers yes the wrapper explains the difference (counted, not
+                        // a finding); anything else is compared as before. See isWrapperRepresentativeChoice.
                         assumeRowsAreEqual(originalResult, variantResult, originalQuery, variantQuery, state);
                     }
                     passedCount++;
@@ -505,6 +509,42 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
             return a.size() == b.size();
         }
         return a.size() == b.size() && resultRowsMatch(a, b);
+    }
+
+    /**
+     * Runs the wrapper-representative gate for one variant: when the wrapped results differ only in
+     * numeric spelling, execute the unwrapped pair and ask whether they return the same rows. If they
+     * do, the wrapper picked a different representative of equal rows (see
+     * {@link #isRepresentativeChoiceOnly}) and this method records and answers true - the check
+     * passes. If they do not, or the gate cannot answer, the difference is reported as usual.
+     *
+     * <p>
+     * The gate only applies when a wrapper is actually in play on at least one side: comparing the
+     * pair again without it is the same comparison that already disagreed, and a self-comparison
+     * under an optimizer mask has no wrapper to blame. A spelling difference there is what the mask
+     * did to one plan, which is exactly what the check exists to catch.
+     * </p>
+     */
+    private boolean isWrapperRepresentativeChoice(String originalQuery, String variantQuery,
+            String unwrappedOriginalQuery, String unwrappedVariantQuery, List<String> originalRows,
+            List<String> variantRows) throws SQLException {
+        if (unwrappedOriginalQuery == null || unwrappedVariantQuery == null
+                || (originalQuery.equals(unwrappedOriginalQuery) && variantQuery.equals(unwrappedVariantQuery))
+                || !isNumericSpellingOnlyDifference(originalRows, variantRows)) {
+            return false;
+        }
+        try {
+            List<String> unwrappedOriginalRows = getResultRows(unwrappedOriginalQuery, errors, state);
+            List<String> unwrappedVariantRows = getResultRows(unwrappedVariantQuery, errors, state);
+            if (isRepresentativeChoiceOnly(originalRows, variantRows, unwrappedOriginalRows, unwrappedVariantRows)) {
+                sqlancer.sqlite3.oracle.EGraphSqlCoverage.recordRepresentativeChoiceDifference(originalQuery,
+                        variantQuery);
+                return true;
+            }
+        } catch (IgnoreMeException | AssertionError e) {
+            // The gate could not answer; report the difference rather than risk excusing a defect.
+        }
+        return false;
     }
 
     private void dumpDatabaseState() {
@@ -847,6 +887,32 @@ public class EGraphMetamorphicOracle<G extends SQLGlobalState<?, ?>> implements 
                     variantQueryString);
         }
         return false;
+    }
+
+    /**
+     * Whether two result sets disagree only in how numbers are spelled: they are not the same
+     * multiset, but folding the integer and float spellings of a number together makes them equal.
+     */
+    static boolean isNumericSpellingOnlyDifference(List<String> originalRows, List<String> variantRows) {
+        if (resultRowsMatch(originalRows, variantRows)) {
+            return false;
+        }
+        return toMultiset(foldNumericSpelling(originalRows)).equals(toMultiset(foldNumericSpelling(variantRows)));
+    }
+
+    /**
+     * The gate's verdict from already-executed rows. A wrapper collapses rows the engine considers
+     * equal (a bare GROUP BY column, DISTINCT) and keeps whichever of them it saw first, which the
+     * documentation calls an arbitrary choice. When the wrapped pair differs only in how a number is
+     * spelled but the unwrapped pair returns exactly the same rows, both spellings were present on
+     * both sides all along and the difference is only which representative the wrapper kept - not a
+     * defect. When the unwrapped pair disagrees, the difference is real (the partial-index affinity
+     * family of 2026-10-01 looks exactly like this) and the check reports it.
+     */
+    static boolean isRepresentativeChoiceOnly(List<String> wrappedOriginalRows, List<String> wrappedVariantRows,
+            List<String> unwrappedOriginalRows, List<String> unwrappedVariantRows) {
+        return isNumericSpellingOnlyDifference(wrappedOriginalRows, wrappedVariantRows)
+                && resultRowsMatch(unwrappedOriginalRows, unwrappedVariantRows);
     }
 
     private static List<String> foldNumericSpelling(List<String> rows) {

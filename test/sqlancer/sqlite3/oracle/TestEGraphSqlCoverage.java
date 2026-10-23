@@ -17,6 +17,7 @@ public class TestEGraphSqlCoverage {
         EGraphSqlCoverage.executedQueries.set(0);
         EGraphSqlCoverage.explainedQueries.set(0);
         EGraphSqlCoverage.explainFailures.set(0);
+        EGraphSqlCoverage.representativeChoiceDifferences.set(0);
     }
 
     @Test
@@ -43,5 +44,11 @@ public class TestEGraphSqlCoverage {
         assertEquals(1, EGraphSqlCoverage.executionHits.get(ExecutionFeature.ORDER_BY).get());
         assertEquals(1, EGraphSqlCoverage.executionHits.get(ExecutionFeature.SUBQUERY).get());
         assertEquals(1, EGraphSqlCoverage.executionHits.get(ExecutionFeature.CORRELATED_SUBQUERY).get());
+    }
+
+    @Test
+    public void testRepresentativeChoiceCounter() {
+        EGraphSqlCoverage.recordRepresentativeChoiceDifference("SELECT 1", "SELECT 2");
+        assertEquals(1, EGraphSqlCoverage.representativeChoiceDifferences.get());
     }
 }

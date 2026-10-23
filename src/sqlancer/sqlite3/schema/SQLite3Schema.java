@@ -309,7 +309,9 @@ public class SQLite3Schema extends AbstractSchema<SQLite3GlobalState, SQLite3Tab
                     }
                     boolean withoutRowid = sqlString.contains("without rowid");
                     boolean isView = tableType.contentEquals("view");
-                    boolean isVirtual = sqlString.contains("virtual");
+                    // Only the CREATE VIRTUAL TABLE form marks a virtual table; a generated column
+                    // declared AS (...) VIRTUAL inside a regular CREATE TABLE must not.
+                    boolean isVirtual = sqlString.matches("^\\s*create\\s+virtual\\s+table\\b.*");
                     boolean isDbStatsTable = sqlString.contains("using dbstat");
                     List<SQLite3Column> databaseColumns = getTableColumns(con, tableName, sqlString, isView,
                             isDbStatsTable);

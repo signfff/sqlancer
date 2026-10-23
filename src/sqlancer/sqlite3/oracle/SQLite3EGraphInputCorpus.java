@@ -144,7 +144,9 @@ public final class SQLite3EGraphInputCorpus {
 
     public static boolean isQueryInput(String statement) {
         String normalized = statement.stripLeading().toUpperCase(Locale.ROOT);
-        return normalized.startsWith("SELECT ") || normalized.startsWith("WITH ");
+        // A query whose first line is exactly "SELECT" (newline right after) must count too;
+        // without the "\n" arm it is classed as a setup statement and a whole case is lost.
+        return normalized.startsWith("SELECT ") || normalized.startsWith("SELECT\n") || normalized.startsWith("WITH ");
     }
 
     public static boolean isSafeEGraphQueryInput(String statement) {

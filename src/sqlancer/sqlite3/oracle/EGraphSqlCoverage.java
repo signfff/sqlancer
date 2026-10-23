@@ -118,6 +118,15 @@ public class EGraphSqlCoverage {
     private static final ConcurrentLinkedQueue<String> numericSpellingSamples = new ConcurrentLinkedQueue<>();
 
     /**
+     * A spelling-only difference that the wrapper explains: the unwrapped pair of queries returns the
+     * same rows, so each side merely kept a different representative of rows the engine considers
+     * equal (a bare GROUP BY column or DISTINCT keeps whichever of them it saw first, which the
+     * documentation calls an arbitrary choice). NOT a finding, counted here rather than above.
+     */
+    static final AtomicInteger representativeChoiceDifferences = new AtomicInteger(0);
+    private static final ConcurrentLinkedQueue<String> representativeChoiceSamples = new ConcurrentLinkedQueue<>();
+
+    /**
      * Comparisons weakened to the row count alone, because the query truncates its rows without saying which ones. A
      * large share here means the oracle is mostly counting rows rather than checking them.
      */
@@ -283,6 +292,17 @@ public class EGraphSqlCoverage {
         numericSpellingDifferences.incrementAndGet();
         if (numericSpellingSamples.size() < MAX_EMPTY_QUERY_SAMPLES) {
             numericSpellingSamples.add(compactSql(originalSql) + "  ||  " + compactSql(variantSql));
+        }
+    }
+
+    /**
+     * A spelling-only difference the wrapper explains: the unwrapped queries agree, so the wrapper
+     * kept a different representative of equal rows. Not a finding; see the field.
+     */
+    public static void recordRepresentativeChoiceDifference(String originalSql, String variantSql) {
+        representativeChoiceDifferences.incrementAndGet();
+        if (representativeChoiceSamples.size() < MAX_EMPTY_QUERY_SAMPLES) {
+            representativeChoiceSamples.add(compactSql(originalSql) + "  ||  " + compactSql(variantSql));
         }
     }
 
@@ -1028,6 +1048,15 @@ public class EGraphSqlCoverage {
                 w.printf("  Rows differing only in how a number is spelled: %d%n",
                         numericSpellingDifferences.get());
                 for (String sample : numericSpellingSamples) {
+                    w.println("  # " + sample);
+                }
+                w.println();
+            }
+
+            if (representativeChoiceDifferences.get() > 0) {
+                w.printf("  Spelling-only differences the wrapper explains (unwrapped queries agree; not findings): %d%n",
+                        representativeChoiceDifferences.get());
+                for (String sample : representativeChoiceSamples) {
                     w.println("  # " + sample);
                 }
                 w.println();
