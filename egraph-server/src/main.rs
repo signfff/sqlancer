@@ -136,6 +136,16 @@ fn preprocess_unquoted_sql(input: &str) -> String {
         })
         .to_string();
 
+    // SQLite accepts DISTINCT as the first argument of any scalar function and ignores it
+    // (trim(DISTINCT x) is trim(x), measured on trunk), and the workload's computable-function
+    // generator wraps the first argument of every function in DISTINCT half the time. sqlparser
+    // special-parses TRIM only, where DISTINCT is read as a bare identifier and the call fails
+    // with `Expected: ), found: <first token of the real argument>` - the commonest refusal of
+    // the 2026-10-13 long run, about 500 of its 700. Strip the no-op from TRIM's argument list.
+    static RE_TRIM_DISTINCT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)\bTRIM\s*\(\s*DISTINCT\b"#).unwrap());
+    let s = RE_TRIM_DISTINCT.replace_all(&s, "TRIM(").to_string();
+
     // SQLite allows an empty list, `x IN ()`, and sqlparser does not: it was the commonest refusal
     // of the 2026-10-07 long run (2265 logged). An empty subquery is the same set - x IN () is 0
     // and x NOT IN () is 1 for every x, NULL included, measured both ways.
@@ -299,8 +309,10 @@ fn walk_back_ident(input: &str, mut end: usize) -> usize {
 /// The operand atom directly left of the byte position `end` (which points at the start of the
 /// `IN` keyword, after any whitespace has been skipped): a parenthesised group (with an optional
 /// function-name prefix), a bracket identifier, a masked quoted string (`\x01N\x02`, with an
-/// optional `x` blob prefix), or a bare identifier/number. Returns the half-open span of the atom.
-/// The input is the quote-masked SQL, so no quote handling is needed here.
+/// optional `x` blob prefix), a bare identifier/number, a `CASE ... END` expression (matched
+/// back from the END keyword), or an atom carrying a trailing COLLATE name. Returns the
+/// half-open span of the atom. The input is the quote-masked SQL, so no quote handling is
+/// needed here.
 fn operand_atom_backwards(input: &str, end: usize) -> Option<(usize, usize)> {
     let bytes = input.as_bytes();
     let mut e = end;
@@ -376,10 +388,79 @@ fn operand_atom_backwards(input: &str, end: usize) -> Option<(usize, usize)> {
             }
             s
         }
-        _ if is_word_byte(c) || c == b'.' => walk_back_ident(input, e),
+        _ if is_word_byte(c) || c == b'.' => {
+            let w = walk_back_ident(input, e);
+            let word = &input[w..e];
+            if word.eq_ignore_ascii_case("END") {
+                // `CASE ... END IN ()`: the operand ends in the END keyword. Walk back to the
+                // CASE that opens this END (CASE/END pair strictly in well-formed text, quoted
+                // identifiers are opaque) and take the whole CASE expression as the operand.
+                return find_case_start(input, w).map(|s| (s, e));
+            }
+            // `x COLLATE name IN ()`: the collation name is the last token of the operand.
+            // RE_COLLATE_CHAIN has already folded chains to a single name. Recurse past the
+            // COLLATE to the collated expression.
+            let mut j = w;
+            while j > 0 && matches!(bytes[j - 1], b' ' | b'\t' | b'\r' | b'\n') {
+                j -= 1;
+            }
+            let cw = walk_back_ident(input, j);
+            if cw < j && input[cw..j].eq_ignore_ascii_case("COLLATE") {
+                if let Some((s2, _)) = operand_atom_backwards(input, cw) {
+                    return Some((s2, e));
+                }
+            }
+            w
+        }
         _ => return None,
     };
     Some((s, e))
+}
+
+/// The byte position where the CASE expression whose END keyword starts at `end` begins: scan
+/// backwards, pairing every nested CASE/END. The input is quote-masked, so string literals
+/// cannot hide a CASE; double-quoted and bracket identifiers are skipped as opaque spans.
+/// None when the start of the input is reached without finding the opening CASE.
+fn find_case_start(input: &str, end: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut i = end;
+    let mut depth = 0usize;
+    loop {
+        if i == 0 {
+            return None;
+        }
+        match bytes[i - 1] {
+            b'"' => {
+                // Skip a double-quoted identifier back to its opening quote.
+                let mut j = i - 1;
+                while j > 0 && bytes[j - 1] != b'"' {
+                    j -= 1;
+                }
+                i = j.saturating_sub(1);
+            }
+            b']' => {
+                let mut j = i - 1;
+                while j > 0 && bytes[j - 1] != b'[' {
+                    j -= 1;
+                }
+                i = j.saturating_sub(1);
+            }
+            _ if is_word_byte(bytes[i - 1]) => {
+                let w = walk_back_ident(input, i);
+                let word = &input[w..i];
+                if word.eq_ignore_ascii_case("END") {
+                    depth += 1;
+                } else if word.eq_ignore_ascii_case("CASE") {
+                    if depth == 0 {
+                        return Some(w);
+                    }
+                    depth -= 1;
+                }
+                i = w;
+            }
+            _ => i -= 1,
+        }
+    }
 }
 
 /// Whether the token left of the captured operand atom can start a new expression at a looser
@@ -841,6 +922,80 @@ mod tests {
             "{:?}",
             variants
         );
+    }
+
+    #[test]
+    fn strips_the_noop_distinct_from_trim_arguments() {
+        // SQLite accepts DISTINCT as the first argument of any scalar function and ignores it
+        // (trim(DISTINCT ' x ') = trim(' x '), measured on trunk); sqlparser's special TRIM
+        // parse reads DISTINCT as a bare identifier and refused every such check - the
+        // commonest refusal of the 2026-10-13 long run.
+        let cases = [
+            "SELECT * FROM t0 WHERE (TRIM(DISTINCT t0.c0))",
+            "SELECT * FROM t0 WHERE (TRIM(DISTINCT rt1.c0, rt1.c3))",
+            "SELECT * FROM t0 WHERE (TRIM(DISTINCT NULL, t0.c0))",
+            "SELECT * FROM t0 WHERE (TRIM ( DISTINCT t0.c0))",
+            // The generator spells the two-argument form with a comma; DISTINCT sits on the
+            // first argument only.
+            "SELECT * FROM t0 WHERE (TRIM(DISTINCT CASE WHEN t0.c0 THEN 1 ELSE 2 END))",
+            // CASE-with-base: the WHEN branch carries the TRIM.
+            "SELECT * FROM t1 WHERE (CASE (x'9039') WHEN TRIM(DISTINCT t1.c2) THEN 1 END)",
+            "SELECT * FROM t1 WHERE (CASE (x'9039') WHEN TRIM(DISTINCT t1.c2, t1.c4) THEN 1 END)",
+        ];
+        for sql in cases {
+            let p = preprocess_sqlite_sql(sql);
+            assert!(!p.to_uppercase().contains("DISTINCT"), "{sql} -> {p}");
+            let variants = generate_variants_for_sql(sql);
+            assert!(!variants.is_empty(), "{sql} -> {p}");
+        }
+        // A masked string literal spelling TRIM(DISTINCT is not a call.
+        assert_eq!(
+            preprocess_sqlite_sql("SELECT * FROM t0 WHERE c0 = 'TRIM(DISTINCT x)'"),
+            "SELECT * FROM t0 WHERE c0 = 'TRIM(DISTINCT x)'"
+        );
+    }
+
+    #[test]
+    fn empty_in_folds_case_and_collated_operands() {
+        // SQLite folds `CASE ... END IN ()` and `x COLLATE name IN ()` to the constant too
+        // (measured on trunk); the operand scan used to stop at the END keyword and at the
+        // collation name and left the text for the sqlparser refusal path.
+        let cases = [
+            (
+                "SELECT * FROM t0 WHERE ((CASE WHEN t0.c0 THEN t0.c0 ELSE t0.c1 END IN ()))",
+                "WHERE ((FALSE))",
+            ),
+            (
+                "SELECT * FROM t0 WHERE (CASE WHEN t0.c0 THEN 1 END NOT IN ())",
+                "WHERE (TRUE)",
+            ),
+            (
+                "SELECT * FROM t0 WHERE ('x' COLLATE RTRIM NOT IN ())",
+                "WHERE (TRUE)",
+            ),
+            // Nested CASE: the END adjacent to IN pairs with the outermost CASE.
+            (
+                "SELECT * FROM t0 WHERE (CASE WHEN CASE t0.c0 WHEN 1 THEN 2 END THEN 3 END IN ())",
+                "WHERE (FALSE)",
+            ),
+            // CASE plus a collation tail.
+            (
+                "SELECT * FROM t0 WHERE (CASE WHEN t0.c0 THEN 1 END COLLATE NOCASE IN ())",
+                "WHERE (FALSE)",
+            ),
+        ];
+        for (sql, want) in cases {
+            let p = preprocess_sqlite_sql(sql);
+            assert!(p.contains(want), "{sql} -> {p}");
+            let variants = generate_variants_for_sql(sql);
+            assert!(!variants.is_empty(), "{sql} -> {p}");
+        }
+        // A JOIN checked for the fold alone: once `rt1.c3 COLLATE BINARY IN ()` becomes
+        // FALSE there is nothing left for the variant generator to rewrite, so it rightly
+        // returns no variants and the empty check above does not apply.
+        let join_sql = "SELECT * FROM t2 INNER JOIN rt1 ON (rt1.c3 COLLATE BINARY IN ())";
+        let p = preprocess_sqlite_sql(join_sql);
+        assert!(p.contains("ON (FALSE)"), "{join_sql} -> {p}");
     }
 
     #[test]
