@@ -2144,6 +2144,22 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
                 && columns.size() < 2) {
             shape = EGraphCoverageShape.PLAIN;
         }
+        if (shape == EGraphCoverageShape.MULTI_INDEX_OR) {
+            // The wrapper references only the first table, so the two indexed columns must belong to
+            // it: with a JOIN base query, columns.get(1) can be a column of the second table and the
+            // CREATE INDEX in addMultiIndexOrIndexes then fails with "no such column", losing the check.
+            List<SQLite3Column> tableColumns = table.getColumns().stream()
+                    .filter(SQLite3OracleFactory::hasUsableIdentifier)
+                    .collect(java.util.stream.Collectors.toList());
+            if (tableColumns.size() < 2) {
+                shape = EGraphCoverageShape.PLAIN;
+            } else {
+                SQLite3Column firstColumn = Randomly.fromList(tableColumns);
+                column = firstColumn;
+                secondColumn = Randomly.fromList(tableColumns.stream().filter(c -> c != firstColumn)
+                        .collect(java.util.stream.Collectors.toList()));
+            }
+        }
         // GROUP BY over every column stands in for DISTINCT, which it is paired against. A joined
         // base query projects every table's columns, and generated tables share names: SQLite renames
         // the repeats to c0:1 and so on, so GROUP BY "c0", "c0", ... groups by the first copy only and
@@ -2298,8 +2314,15 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
                 return "SELECT * FROM (SELECT * FROM (" + query
                         + ") AS egraph_co_inner LIMIT -1) AS egraph_co ORDER BY 1";
             case MULTI_INDEX_OR:
-                return "SELECT * FROM (" + query + ") AS egraph_outer WHERE egraph_outer." + columnName
-                        + " = 0 OR egraph_outer." + secondColumnName + " = 0";
+                // The old form filtered with "WHERE egraph_outer.c1 = 0 OR egraph_outer.c2 = 0": it
+                // threw the rows away whenever none matched (61.8% of the checks in the 20261023 run
+                // were lost to an empty probe) and failed outright when the base query does not
+                // project those columns. A scalar subquery over the real table keeps every outer row
+                // - count(*) is always one value - and still hands the planner an OR across two
+                // single-column indexes, which is what the MULTI-INDEX OR RowSet path needs.
+                return "SELECT egraph_outer.*, (SELECT count(*) FROM " + tableName + " AS egraph_mio_probe WHERE "
+                        + "egraph_mio_probe." + columnName + " = 0 OR egraph_mio_probe." + secondColumnName
+                        + " = 0) AS egraph_mio_hits FROM (" + query + ") AS egraph_outer";
             case LIMIT_OFFSET:
                 return "SELECT * FROM (" + query + ") AS egraph_limit LIMIT -1 OFFSET 0";
             case WHERE_CASE_TRUE:
