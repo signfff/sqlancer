@@ -1,8 +1,9 @@
 use egg::{rewrite, EGraph, FromOp, Id, Language, RecExpr, Rewrite, Runner};
 use rusqlite::Connection;
 use sqlparser::ast::{
-    helpers::attached_token::AttachedToken, BinaryOperator, CaseWhen, Expr as SqlExpr, GroupByExpr,
-    Ident, OrderByKind, Query, SelectItem, SetExpr, UnaryOperator, Value,
+    helpers::attached_token::AttachedToken, BinaryOperator, CaseWhen, Expr as SqlExpr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, OrderByKind, Query, SelectItem, SetExpr,
+    UnaryOperator, Value,
 };
 use sqlparser::tokenizer::Span;
 use std::collections::{HashMap, HashSet};
@@ -3368,12 +3369,49 @@ fn collect_sql_identifiers(expr: &SqlExpr, ids: &mut HashSet<String>) {
                 collect_sql_identifiers(item, ids);
             }
         }
-        // Function calls: in EGRAPH mode these are excluded from generation,
-        // but handle defensively.  We skip recursing into function arguments
-        // (the variant api differs across sqlparser versions).  If columns
-        // inside function bodies are missed, the SQLite validation returns
-        // None and the caller falls back to the in-memory evaluator.
-        //
+        SqlExpr::Function(f) => match &f.args {
+            // Function arguments used to be skipped out of caution about the sqlparser API. They
+            // are the only place a column can hide in json_*(c0), lower(c0) and friends, and with
+            // them skipped the validator saw an empty identifier set and passed the variant
+            // through without ever touching SQLite - the hole behind the whole variant-error
+            // noise family on the client.
+            FunctionArguments::List(list) => {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
+                        collect_sql_identifiers(inner, ids);
+                    }
+                }
+            }
+            _ => {}
+        },
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(inner) = operand {
+                collect_sql_identifiers(inner, ids);
+            }
+            for c in conditions {
+                collect_sql_identifiers(&c.condition, ids);
+                collect_sql_identifiers(&c.result, ids);
+            }
+            if let Some(inner) = else_result {
+                collect_sql_identifiers(inner, ids);
+            }
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::SimilarTo { expr, pattern, .. } => {
+            collect_sql_identifiers(expr, ids);
+            collect_sql_identifiers(pattern, ids);
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            collect_sql_identifiers(l, ids);
+            collect_sql_identifiers(r, ids);
+        }
+        SqlExpr::Cast { expr, .. } | SqlExpr::Collate { expr, .. } => {
+            collect_sql_identifiers(expr, ids);
+        }
         // Literals, subqueries, wildcards, etc. ?stop recursing
         _ => {}
     }
@@ -3542,8 +3580,36 @@ fn validate_with_sqlite(
     match conn.query_row(&compare_sql, [], |row| row.get::<_, i64>(0)) {
         Ok(0) => Some(true),  // all rows matched ?equivalent
         Ok(_) => Some(false), // at least one row differed ?NOT equivalent
-        Err(_) => None,       // SQL error ?can't validate, fall back
+        Err(_) => {
+            // A row on which one spelling errors and the other does not is the variant the client
+            // later logs as a variant-only error: on real data it abandons the whole check, so the
+            // comparison budget is spent either way. Probe each side over the whole table -
+            // short-circuit evaluation means the original can skip an erroring json_* call (or
+            // load_extension and friends) that the rewrite moved in front of its guard, which is
+            // exactly the one-sided case. Rejecting it here costs the client nothing.
+            match (
+                probe_expr_errors(&conn, &orig_sql, &table_name),
+                probe_expr_errors(&conn, &var_sql, &table_name),
+            ) {
+                (true, false) | (false, true) => Some(false),
+                _ => None, // both error or neither: fall back as before
+            }
+        }
     }
+}
+
+/// Whether evaluating `expr_sql` over the validator table raises an SQL error on any row.
+///
+/// COUNT(*) without a LIMIT forces the expression to be evaluated for every row (a LIMIT 1 could
+/// stop on a TRUE row before reaching the one that errors). rusqlite's `execute` refuses SELECT
+/// statements, so this goes through `query_row`.
+fn probe_expr_errors(conn: &Connection, expr_sql: &str, table_name: &str) -> bool {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM \"{}\" WHERE ({})", table_name, expr_sql),
+        [],
+        |_| Ok(()),
+    )
+    .is_err()
 }
 
 /// Generate a random SQL literal string for test-data insertion.
@@ -4802,5 +4868,35 @@ mod tests {
             three_valued_or(SqlValue::Null, SqlValue::Bool(true)),
             SqlValue::Bool(true)
         );
+    }
+
+    #[test]
+    fn a_variant_that_errors_where_the_original_does_not_is_rejected() {
+        // json_quote raises "JSON cannot hold BLOB values" on the non-empty BLOB rows in the
+        // validator data (x'' and x'31'); lower never errors. The SUM comparison itself errors on
+        // those rows, and the per-side probes must then reject the variant instead of falling back
+        // to the in-memory evaluator, which cannot see the error. A short-circuit-shaped pair is
+        // not deterministic here: SQLite reorders WHERE terms by cost, so a cheap guard placed
+        // first can swallow the error on both sides.
+        let orig = parse_predicate("SELECT * FROM t0 WHERE lower(c0) = lower(c0)");
+        let var = parse_predicate("SELECT * FROM t0 WHERE json_quote(c0) = json_quote(c0)");
+        let verdict = validate_with_sqlite(&orig, &var, "", SQLITE_SAMPLES);
+        assert_eq!(verdict, Some(false));
+    }
+
+    #[test]
+    fn a_variant_that_keeps_the_original_evaluation_order_still_passes() {
+        // The json call stays behind its guard on both sides, so the pair must never be rejected.
+        // Whether the SUM comparison answers (Some(true)) or both sides error on the same
+        // validator rows and the fallback decides (None) depends on how SQLite orders the WHERE
+        // terms; either way it is not a one-sided error.
+        let orig = parse_predicate(
+            "SELECT * FROM t0 WHERE (unlikely(c0) = unlikely(-1826126326)) AND json_quote(c0) AND lower(c0)",
+        );
+        let var = parse_predicate(
+            "SELECT * FROM t0 WHERE (unlikely(c0) = unlikely(-1826126326)) AND lower(c0) AND json_quote(c0)",
+        );
+        let verdict = validate_with_sqlite(&orig, &var, "", SQLITE_SAMPLES);
+        assert!(matches!(verdict, Some(true) | None), "{:?}", verdict);
     }
 }
