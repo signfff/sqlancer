@@ -2034,7 +2034,9 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("case-cond-case"; "(case (case ?c ?d ?e) ?a ?b)" => "(case ?c (case ?d ?a ?b) (case ?e ?a ?b))"),
         rewrite!("add-into-case"; "(+ (case ?c ?a ?b) ?d)" => "(case ?c (+ ?a ?d) (+ ?b ?d))"),
         rewrite!("concat-into-case"; "(concat (case ?c ?a ?b) ?d)" => "(case ?c (concat ?a ?d) (concat ?b ?d))"),
-        rewrite!("concat-into-coalesce"; "(concat (coalesce ?a ?b) ?c)" => "(coalesce (concat ?a ?c) (concat ?b ?c))"),
+        //  concat-into-coalesce removed (20261031): with ?a non-NULL and ?c NULL the lhs is
+        //  NULL (the inner coalesce short-circuits) while the rhs falls through to the second
+        //  branch and can raise an error the original never sees, e.g. abs(INT64_MIN).
         rewrite!("coalesce-into-case"; "(coalesce (case ?c ?a ?b) ?d)" => "(case ?c (coalesce ?a ?d) (coalesce ?b ?d))"),
         //  COLLATE (agent round 8). eq-swap-same-collate and lt-swap-same-collate repeat the
         //  guarded swaps for two sides with the same explicit collation, where the guard withholds them.
@@ -2175,8 +2177,9 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("not-into-coalesce"; "(not (coalesce ?a ?b))" => "(coalesce (not ?a) (not ?b))"),
         rewrite!("neg-into-coalesce"; "(neg (coalesce ?a ?b))" => "(coalesce (neg ?a) (neg ?b))"),
         rewrite!("bitnot-into-coalesce"; "(bitnot (coalesce ?a ?b))" => "(coalesce (bitnot ?a) (bitnot ?b))"),
-        rewrite!("bitand-into-coalesce"; "(bitand (coalesce ?a ?b) ?c)" => "(coalesce (bitand ?a ?c) (bitand ?b ?c))"),
-        rewrite!("bitor-into-coalesce"; "(bitor (coalesce ?a ?b) ?c)" => "(coalesce (bitor ?a ?c) (bitor ?b ?c))"),
+        //  bitand/bit-into-coalesce removed (20261031): same shape as the removed
+        //  concat-into-coalesce - a NULL operand makes f(non-NULL) NULL, so the outer coalesce
+        //  falls through to the second branch and can raise an error the original skips.
         rewrite!("coalesce-dup-inner"; "(coalesce ?a (coalesce ?a ?b))" => "(coalesce ?a ?b)"),
         rewrite!("coalesce-absorb-tail"; "(coalesce (coalesce ?a ?b) ?a)" => "(coalesce ?a ?b)"),
         rewrite!("coalesce-dead-fallback-isnull"; "(coalesce (isnull ?a) ?b)" => "(isnull ?a)"),
@@ -2188,7 +2191,8 @@ fn make_base_rewrite_rules() -> Vec<Rewrite<SqlLang, ()>> {
         rewrite!("istrue-nullif"; "(istrue (nullif ?a ?b))" => "(and (istrue ?a) (isnotnull (nullif ?a ?b)))"),
         rewrite!("isfalse-nullif"; "(isfalse (nullif ?a ?b))" => "(and (isfalse ?a) (isnotnull (nullif ?a ?b)))"),
         rewrite!("not-nullif-guard"; "(not (nullif ?a ?b))" => "(case (isnull (nullif ?a ?b)) (nullif ?a ?b) (not ?a))"),
-        //  Removed the same way: concat-into-coalesce, coalesce-into-case.
+        //  Removed for explicit COLLATE: concat-into-coalesce (restored once the COLLATE guard
+        //  landed, then removed again for the error asymmetry above), coalesce-into-case.
         //  CAST (agent round 5). The three *-sym-cast-* swaps are reached by the guarded swap rules when those are allowed; they are kept for the queries the guard withholds them from, which is sound because both sides are numbers after the cast.
         rewrite!("cast-real-idem"; "(cast_real (cast_real ?x))" => "(cast_real ?x)"),
         rewrite!("cast-text-idem"; "(cast_text (cast_text ?x))" => "(cast_text ?x)"),
@@ -4898,5 +4902,17 @@ mod tests {
         );
         let verdict = validate_with_sqlite(&orig, &var, "", SQLITE_SAMPLES);
         assert!(matches!(verdict, Some(true) | None), "{:?}", verdict);
+    }
+
+    #[test]
+    fn the_error_asymmetric_coalesce_distributions_stay_removed() {
+        // Distributing an inner coalesce to an outer one is unsound whenever a NULL result on
+        // the first branch forces evaluation of the second: an erroring second argument (e.g.
+        // abs(INT64_MIN)) then raises where the original returned NULL. concat/bitand/bitor
+        // all have f(non-NULL) = NULL for a NULL operand, so they were removed (20261031).
+        let names: Vec<String> = make_rewrite_rules(true).iter().map(|r| r.name.to_string()).collect();
+        for removed in ["concat-into-coalesce", "bitand-into-coalesce", "bitor-into-coalesce"] {
+            assert!(!names.iter().any(|n| n == removed), "{} is back", removed);
+        }
     }
 }
