@@ -1,0 +1,79 @@
+######## 3.54.0 本机 sqlite3_trunk.exe（repro.sql 逐行输出，2026-11-10 验证）
+== SELECT '' IS 0;                     -> 0
+== SELECT '' IS (0 IN ());             -> 1
+== SELECT typeof(0 IN ());             -> integer
+== SELECT '' IS NOT 0, '' IS NOT (0 IN ()), '' IS NOT FALSE;   -> 1|0|0
+== SELECT '' IS (length('') IN ());    -> 0
+== SELECT (0 IN ()) + 1, (0 IN ()) = 0, CASE WHEN (0 IN ()) THEN 1 ELSE 0 END;  -> 1|1|0
+== SELECT 0 IS (0 IN ()), 1 IS (0 IN ());  -> 1|0
+
+######## 3.54.0 本机（cand-bug.sql 语义矩阵）
+== typeof empty IN:      integer | 0
+== IS value 0:           ''|'0'|'1'|'abc'|NULL IS 0          -> 0|0|0|0|0
+== IS empty IN:          ''|'0'|'1'|'abc'|NULL IS (5 IN ())  -> 1|1|0|1|0
+== IS FALSE kw:          ''|'0'|'1'|'abc'|NULL IS FALSE      -> 1|1|0|1|0   （与空 IN 行一致）
+== IS NOT IN side:       '1' IS (5 NOT IN ())=1, '1' IS TRUE=1, '1' IS 1=0, '' IS (5 NOT IN ())=0, '' IS TRUE=0
+== func LHS:             '' IS (length('') IN ()) = 0, '' IS (length('') NOT IN ()) = 0   （聚合安全分支，反而"正常"）
+== plain contexts:       (5 IN ())+1=1, (5 IN ())=0=1, CASE WHEN (5 IN ()) THEN 1 ELSE 0 END=0
+
+######## 版本对照（全部一致复现）
+== 3.51.0（python sqlite3 模块）        matrix.sql 逐项一致（2026-11-09/10 验证）
+== 3.54.0（本机 sqlite3_trunk.exe）     同上
+== 3.55.0（服务器 trunk ddd6db1c）      原现场包 + probe.sql 在服务器二进制上验证
+== master 2026-11-04（上游）            复现（服务器 fetch 上游源码核对）
+
+######## 现场包（run-20261031 repro/0001，SUT=trunk ddd6db1c/3.55.0，1 线程 combined 掩码）
+== case.txt 头部:
+source: RANDOM_GENERATED_1_3
+variant mask: 0x2000000 (Coroutines off)
+original rows: 10, variant rows: 0
+base query sent to the rewrite server:
+SELECT ALL * FROM rt1 WHERE (((((((rt1.c1)<=(1000000.0)))AND(((rt1.c2)>=(-1000000)))))AND(((TRIM(rt1.c1, rt1.c1))IS((-693048757 IN ())))))) ORDER BY rt1.c2 ASC, rt1.c0 ASC, rt1.c1 ASC LIMIT 10;
+== bisect 定位：第三合取式 original TRIM(c1,c1) IS (k IN ())（≡ NOT TRIM(...)，对 '' 为 1 行通过）
+                vs variant (0 = TRIM(c1,c1)) IS TRUE（0 = '' 为 0，行被过滤光）
+== optmask-findings.log：original+mask 10 行 / variant+mask 0 行 → 与掩码无关（query 级差异）
+
+######## 源码（src/parse.y，空 IN 规则，1497–1518 行）
+  expr(A) ::= expr(A) in_op(N) LP exprlist(Y) RP. [IN] {
+    if( Y==0 ){
+      /* Expressions of the form
+      **      expr1 IN ()
+      **      expr1 NOT IN ()
+      ** simplify to constants 0 (false) and 1 (true), respectively.
+      ** Except, do not apply this optimization if expr1 contains a function
+      ** because that function might be an aggregate (we don't know yet whether
+      ** it is or not) and if it is an aggregate, that could change the meaning
+      ** of the whole query.
+      */
+      Expr *pB = sqlite3Expr(pParse->db, TK_STRING, N ? "true" : "false");
+      if( pB ) sqlite3ExprIdToTrueFalse(pB);       <-- 造 TK_TRUEFALSE 布尔词，注释却说是常量 0/1
+      if( !ExprHasProperty(A, EP_HasFunc) ){
+        sqlite3ExprUnmapAndDelete(pParse, A);
+        A = pB;
+      }else{
+        A = sqlite3PExpr(pParse, N ? TK_OR : TK_AND, pB, A);
+      }
+    }else{ ... }
+
+######## 文档依据（lang_expr.html，2026-11-10 fetch）
+== IN 空集："When the right operand is an empty set, the result of IN is false and the result
+   of NOT IN is true, regardless of the left operand and even if the left operand is NULL."
+== 空列表扩展："[SQLite allows] the parenthesized list of scalar values on the right-hand side
+   of an IN or NOT IN operator to be an empty list but most other SQL database engines and the
+   SQL92 standard require the list to contain at least one element."
+== TRUE/FALSE 与 IS："The boolean identifiers TRUE and FALSE are usually just aliases for the
+   integer values 1 and 0, respectively. However, if TRUE or FALSE occur on the right-hand side
+   of an IS operator, then the IS operator evaluates the left-hand operand as a boolean value
+   and returns an appropriate answer."
+
+######## 历史与先例检索（2026-11-10）
+== changelog：2002-10-31 (2.7.3) "Fix a bug in the 'expr IN ()' operator." —— 空 IN 支持已 24 年，
+   此后无任何条目再动过这条规则
+== 论坛全文搜索："empty IN list"、'IN ()' 均无先例报告（2024-08 "Bug in NOT IN?" 帖是 NULL 在
+   IN 列表的另一话题）
+
+######## 发帖记录
+== 2026-11-10 13:17:50 UTC 提交，artifact fb2e7f646b，状态 Awaiting Moderator Approval
+== 帖：https://sqlite.org/bugs/forumpost/fb2e7f646b
+== 个人 timeline（含审核状态）：https://sqlite.org/bugs/timeline?u=signnn
+== 帖文 = report-draft.md 的 English (post body) 一节（与草稿一字不差）

@@ -15,12 +15,13 @@
 |---|---|---|---|---|---|---|---|
 | [001](001-fts4-contentless-integrity-check/) | 2026-10-02 | FTS4 / xIntegrity | 误报损坏（integrity_check 假阳性） | 每张无内容 FTS4 表在体检时都报错 | 长跑工作负载建出的表 + 分诊 CORRUPT 时跑的 integrity_check | 3.44.0 | **已修复**：ca8de9a304（Dan Kennedy，报告后约 2 小时） |
 | [002](002-in-single-element-collate/) | 2026-10-08 | 解析器 / IN 运算符 / 排序规则 | 查询结果错误（逻辑 bug） | 单元素 IN 列表使用了右侧常量的显式 COLLATE，与文档和多元素列表都不一致 | 规则扩张流程：agent 提出线索 + rulegate 在真 SQLite 上验证 | 未定位（3.51.0 起各版本均可复现） | **已修复**：53a73aa03d（drh，报告后约 6.5 小时，回归测试进 TH3） |
+| [003](003-is-empty-in-list/) | 2026-11-10 | 解析器 / IN 运算符 / IS 真值特例 | 语义/文档不一致 | `x IS (y IN ())` ≡ NOT x 而非 `x IS 0`（空串/零长 blob 的 x 可观察） | 渠道 3（蜕变判定器）：长跑 20261031 现场包 repro/0001 由 oracle 报出、分诊定性 | 空 IN 简化自 2002（2.7.3）；3.51.0 起各版本均可复现 | **已提交待审核**：fb2e7f646b（2026-11-10 13:17:50 UTC） |
 
 ## 发现渠道（写论文时的分类）
 
 1. **测试负载的副产品**（001）：长跑时 e-graph 判定器为覆盖率专门建了各种上下文表，其中包括无内容 FTS4 表。后来分诊另一起 SQLITE_CORRUPT 时，对这些库跑 `PRAGMA integrity_check`，发现每个库都报错，由此定位。2026-10-07 起，长跑会自动读取上下文中所有 integrity_check / quick_check / rtreecheck 的结果（`EGraphIntegrityCheck`），这一渠道已自动化。
 2. **规则验证即差分测试**（002）：为 e-graph 补充等价改写规则时，每条候选规则都要用 `coverage/sqlite/rulegate/rulegate.py` 在真 SQLite 上，对各种取值和上下文逐一判定两侧是否相等。一条按文档语义成立的规则在 SQLite 上失败，说明实现与规格不符。这次的线索来自 LLM agent 对源码的记忆，rulegate 系统地复现了它（6 条规则全部撞上同一个反例形状）。
-3. **蜕变判定器本身**（长跑中原查询与变体结果不一致）：截至 2026-10-08，在 trunk 上没有发现新的 SQLite bug。期间所有报出的不一致都已定性为自家工具的问题（见项目记忆 server-long-runs、temp-table-referee-blindspot、pipeline-audit-20261007）。在发布版 3.53.4 上，判定器能稳定检出基准里的已知 bug（4/5，见 `coverage/sqlite/bugbench`）。
+3. **蜕变判定器本身**（长跑中原查询与变体结果不一致）：截至 2026-10-08，在 trunk 上没有发现新的 SQLite bug。期间所有报出的不一致都已定性为自家工具的问题（见项目记忆 server-long-runs、temp-table-referee-blindspot、pipeline-audit-20261007）。**2026-11-10 产生第一例**：003 由长跑 20261031 现场包 repro/0001 的 original/variant 行数差异（10 vs 0）引入视野并 bisect 定位，SQLite 的语义/文档不一致在假阳性分诊中定性——论文口径须写成 "surfaced and localized by the oracle, identified by triage analysis"。在发布版 3.53.4 上，判定器能稳定检出基准里的已知 bug（4/5，见 `coverage/sqlite/bugbench`）。
 
 ## 报告经验（001 两小时内被修复的原因）
 
